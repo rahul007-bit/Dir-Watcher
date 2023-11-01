@@ -1,0 +1,44 @@
+config:
+  watch:
+    - ~/Downloads
+    # - ~/Desktop
+  file-type:
+    - documents
+      - pdf
+      - doc
+      - docx
+      - xls
+      - xlsx
+      - ppt
+      - pptx
+      - txt
+    - images
+      - jpg
+      - jpeg
+      - png
+      - gif
+      - tiff
+      - bmp
+    - videos
+      - mp4
+      - mov
+      - avi
+      - mkv
+      - flv
+      - m4v
+      - rmvb
+      - rm
+      - 3gp
+      - mpg
+      - mpeg
+      - webm
+    - audios
+      - mp3
+      - wav
+      - wma
+      - ogg
+      - m4a
+      - aac
+      - aiff
+
+
