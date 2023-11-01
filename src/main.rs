@@ -15,8 +15,12 @@ use yaml_rust::YamlLoader;
 fn main() {
     start_daemon();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let config_path = home_dir().unwrap().join(".config/watch-dir/config.yaml");
+    if !config_path.exists() {
+        load_config();
+    }
     // reading the config file from ~/.config/watch-dir/config.yaml
-    let s = fs::read_to_string(home_dir().unwrap().join(".config/watch-dir/config.yaml")).unwrap();
+    let s = fs::read_to_string(config_path).unwrap();
 
     let doc = YamlLoader::load_from_str(&s).unwrap();
     let binding = doc[0]["config"]["watch"].as_vec();
@@ -178,4 +182,57 @@ fn start_daemon() {
             exit(-1);
         },
     }
+}
+
+
+fn load_config(){
+    let config = "
+    config:
+  watch:
+    - ~/Downloads
+  file-types:
+    documents:
+      - pdf
+      - doc
+      - docx
+      - xls
+      - xlsx
+      - ppt
+      - pptx
+      - txt
+    images:
+      - jpg
+      - jpeg
+      - png
+      - gif
+      - tiff
+      - bmp
+    videos:
+      - mp4
+      - mov
+      - avi
+      - mkv
+      - flv
+      - m4v
+      - rmvb
+      - rm
+      - 3gp
+      - mpg
+      - mpeg
+      - webm
+    audios:
+      - mp3
+      - wav
+      - wma
+      - ogg
+      - m4a
+      - aac
+      - aiff
+    ";
+    let config_path = home_dir().unwrap().join(".config/watch-dir/config.yaml");
+    if !config_path.exists() {
+        fs::create_dir_all(home_dir().unwrap().join(".config/watch-dir")).unwrap();
+        fs::write(config_path,config).unwrap();
+    }
+
 }
