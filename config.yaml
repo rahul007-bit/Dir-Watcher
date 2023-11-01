@@ -2,8 +2,8 @@ config:
   watch:
     - ~/Downloads
     # - ~/Desktop
-  file-type:
-    - documents
+  file-types:
+    documents:
       - pdf
       - doc
       - docx
@@ -12,14 +12,14 @@ config:
       - ppt
       - pptx
       - txt
-    - images
+    images:
       - jpg
       - jpeg
       - png
       - gif
       - tiff
       - bmp
-    - videos
+    videos:
       - mp4
       - mov
       - avi
@@ -32,7 +32,7 @@ config:
       - mpg
       - mpeg
       - webm
-    - audios
+    audios:
       - mp3
       - wav
       - wma
