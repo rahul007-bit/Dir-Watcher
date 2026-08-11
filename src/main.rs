@@ -146,14 +146,12 @@ fn watch(dirs: Vec<WatchDir>, ignore_extensions: HashSet<String>, stability: Sta
         match res {
             Ok(event) =>{
                 match event.kind {
-                    notify::event::EventKind::Create(file)=>{
-                        // check if the created file is a not a directory
-                        match file {
-                            notify::event::CreateKind::File=>{
-                                handle_new_file(event, &dirs, &ignore_extensions, stability);
-                            },
-                            _=>{}
-                        }
+                    notify::event::EventKind::Create(notify::event::CreateKind::Folder) => {}
+                    notify::event::EventKind::Create(_)=>{
+                        // Windows' backend often reports CreateKind::Any rather than
+                        // CreateKind::File, so accept anything but Folder and let
+                        // handle_new_file's is_file() check filter the rest.
+                        handle_new_file(event, &dirs, &ignore_extensions, stability);
                     },
                     _ => {}
                 }
@@ -167,6 +165,10 @@ fn watch(dirs: Vec<WatchDir>, ignore_extensions: HashSet<String>, stability: Sta
 
 fn handle_new_file(event: Event, dirs: &[WatchDir], ignore_extensions: &HashSet<String>, stability: StabilityConfig) {
     let path = event.paths[0].clone();
+
+    if path.is_dir() {
+        return;
+    }
 
     let parent_dir = match path.parent() {
         Some(x) => x,
