@@ -1,14 +1,14 @@
-extern crate daemonize_me;
 extern crate yaml_rust;
 
+#[cfg(unix)]
+extern crate daemonize_me;
 #[cfg(unix)]
 use daemonize_me::Daemon;
 use home::home_dir;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event};
-use std::{path::{Path, PathBuf}, fs::{
-    self,
-    File,
-}, collections::{HashMap, HashSet}, process::exit, thread, time::Duration};
+use std::{path::{Path, PathBuf}, fs::{self}, collections::{HashMap, HashSet}, thread, time::Duration};
+#[cfg(unix)]
+use std::{fs::File, process::exit};
 
 use yaml_rust::{Yaml, YamlLoader};
 
