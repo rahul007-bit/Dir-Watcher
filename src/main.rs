@@ -1,16 +1,29 @@
 extern crate daemonize_me;
 extern crate yaml_rust;
 
+#[cfg(unix)]
 use daemonize_me::Daemon;
 use home::home_dir;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event};
-use std::{path::Path, fs::{
+use std::{path::{Path, PathBuf}, fs::{
     self,
     File,
-}, collections::HashMap, process::exit};
+}, collections::{HashMap, HashSet}, process::exit, thread, time::Duration};
 
-use yaml_rust::YamlLoader;
+use yaml_rust::{Yaml, YamlLoader};
 
+
+#[derive(Clone)]
+struct WatchDir {
+    path: PathBuf,
+    file_types: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+struct StabilityConfig {
+    interval: Duration,
+    required_stable_ticks: u32,
+}
 
 fn main() {
     start_daemon();
@@ -23,63 +36,98 @@ fn main() {
     let s = fs::read_to_string(config_path).unwrap();
 
     let doc = YamlLoader::load_from_str(&s).unwrap();
-    let binding = doc[0]["config"]["watch"].as_vec();
-    let files_to_watch = match &binding {
+    let config = &doc[0]["config"];
+
+    let default_file_types = parse_file_types(&config["file-types"]);
+
+    let binding = config["watch"].as_vec();
+    let watch_entries = match &binding {
         Some(x) => x,
         None => panic!("No files to watch")
     };
 
-    let file_types = &doc[0]["config"]["file-types"];
-    let mut path: Vec<String> = Vec::new();
-    for file in files_to_watch.iter() {
-        let file = match file.as_str() {
+    let mut dirs: Vec<WatchDir> = Vec::new();
+    for entry in watch_entries.iter() {
+        let raw_path = match entry["path"].as_str() {
             Some(x) => x,
-            None => panic!("No file")
+            None => panic!("Watch entry missing 'path'")
         };
 
-        let path_to_watch = file;
-        if path_to_watch.starts_with("~/") {
-            let home_dir = home::home_dir().unwrap();
-            let path_to_watch = path_to_watch.replace("~/", "");
-            let path_to_watch = home_dir.join(path_to_watch);
-            path.push(path_to_watch.to_str().unwrap().to_string());
-            continue;
-        }
-        path.push(path_to_watch.to_string());
-    }
-    let file_type_hash = match file_types.as_hash() {
-        Some(x) => {
-            let mut file_type_hash: HashMap<String, String> = HashMap::new();
-            for (key, value) in x.iter() {
-                let key = match key.as_str() {
-                    Some(x) => x,
-                    None => panic!("No key")
-                };
-                let value = match value.as_vec() {
-                    Some(x) => x,
-                    None => panic!("No value")
-                };
-                for file_type in value.iter() {
-                    let file_type = match file_type.as_str() {
-                        Some(x) => x,
-                        None => panic!("No file type")
-                    };
-                    file_type_hash.insert(file_type.to_string(), key.to_string());
-                }
-            }
-            file_type_hash
-        },
-        None => panic!("No file types")
-    };
+        let path = resolve_path(raw_path);
 
-    log::info!("Watching {path:?}");
-    if let Err(error) = watch(path, file_type_hash) {
+        let file_types = if entry["file-types"].is_badvalue() {
+            default_file_types.clone()
+        } else {
+            parse_file_types(&entry["file-types"])
+        };
+
+        dirs.push(WatchDir { path, file_types });
+    }
+
+    let ignore_extensions = parse_ignore_extensions(&config["ignore-extensions"]);
+    let stability = parse_stability(&config["stability"]);
+
+    log::info!("Watching {:?}", dirs.iter().map(|d| &d.path).collect::<Vec<_>>());
+    if let Err(error) = watch(dirs, ignore_extensions, stability) {
         log::error!("Error: {error:?}");
     }
 }
 
+fn resolve_path(raw_path: &str) -> PathBuf {
+    if let Some(stripped) = raw_path.strip_prefix("~/") {
+        home::home_dir().unwrap().join(stripped)
+    } else {
+        PathBuf::from(raw_path)
+    }
+}
 
-fn watch(path: Vec<String>,file_types: HashMap<String,String>) -> notify::Result<()> {
+fn parse_file_types(node: &Yaml) -> HashMap<String, String> {
+    let mut file_type_hash: HashMap<String, String> = HashMap::new();
+    let hash = match node.as_hash() {
+        Some(x) => x,
+        None => panic!("No file types")
+    };
+    for (key, value) in hash.iter() {
+        let key = match key.as_str() {
+            Some(x) => x,
+            None => panic!("No key")
+        };
+        let value = match value.as_vec() {
+            Some(x) => x,
+            None => panic!("No value")
+        };
+        for file_type in value.iter() {
+            let file_type = match file_type.as_str() {
+                Some(x) => x,
+                None => panic!("No file type")
+            };
+            file_type_hash.insert(file_type.to_lowercase(), key.to_string());
+        }
+    }
+    file_type_hash
+}
+
+fn parse_ignore_extensions(node: &Yaml) -> HashSet<String> {
+    match node.as_vec() {
+        Some(x) => x.iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .collect(),
+        None => HashSet::new(),
+    }
+}
+
+fn parse_stability(node: &Yaml) -> StabilityConfig {
+    let interval_ms = node["interval-ms"].as_i64().unwrap_or(1000) as u64;
+    let required_stable_ticks = node["required-stable-ticks"].as_i64().unwrap_or(2) as u32;
+    StabilityConfig {
+        interval: Duration::from_millis(interval_ms),
+        required_stable_ticks,
+    }
+}
+
+
+fn watch(dirs: Vec<WatchDir>, ignore_extensions: HashSet<String>, stability: StabilityConfig) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Automatically select the best implementation for your platform.
@@ -89,9 +137,8 @@ fn watch(path: Vec<String>,file_types: HashMap<String,String>) -> notify::Result
     // Add a path to be watched. All files and directories at that path and
     // below will be monitored for changes.
 
-    for path in path.iter() {
-        watcher.watch(
-            Path::new(path).as_ref(), RecursiveMode::Recursive)?;
+    for dir in dirs.iter() {
+        watcher.watch(dir.path.as_path(), RecursiveMode::Recursive)?;
     }
 
     for res in rx {
@@ -102,9 +149,8 @@ fn watch(path: Vec<String>,file_types: HashMap<String,String>) -> notify::Result
                         // check if the created file is a not a directory
                         match file {
                             notify::event::CreateKind::File=>{
-                                if let Err(err) = new_file_created(event,path.clone(),file_types.clone()) {
-                                    log::error!("Error: {err:?}");
-                            }},
+                                handle_new_file(event, &dirs, &ignore_extensions, stability);
+                            },
                             _=>{}
                         }
                     },
@@ -118,44 +164,86 @@ fn watch(path: Vec<String>,file_types: HashMap<String,String>) -> notify::Result
     Ok(())
 }
 
-fn new_file_created(event:notify::event::Event,path: Vec<String>,file_types: HashMap<String,String>) -> notify::Result<()> {
-    println!("New file created: {:?}",event);
-    // check if that file's parent directory is in the list of directories to watch
-    let parent_dir = event.paths[0].parent().unwrap().to_str().unwrap();
-    let mut parent_dir_in_list = false;
-    for dir in path.iter() {
-        if dir == parent_dir {
-            parent_dir_in_list = true;
-            break;
+fn handle_new_file(event: Event, dirs: &[WatchDir], ignore_extensions: &HashSet<String>, stability: StabilityConfig) {
+    let path = event.paths[0].clone();
+
+    let parent_dir = match path.parent() {
+        Some(x) => x,
+        None => return,
+    };
+    let matched_dir = dirs.iter().find(|d| d.path == parent_dir);
+    let matched_dir = match matched_dir {
+        Some(x) => x.clone(),
+        None => return,
+    };
+
+    let extension = match path.extension().and_then(|e| e.to_str()) {
+        Some(x) => x.to_lowercase(),
+        None => return, // extensionless file / dotfile, nothing to sort by
+    };
+
+    if ignore_extensions.contains(&extension) {
+        return;
+    }
+
+    thread::spawn(move || {
+        if !wait_until_stable(&path, stability.interval, stability.required_stable_ticks) {
+            return;
         }
-    }
-    if !parent_dir_in_list {
-        return Ok(());
-    }
-    // check if the file type is in the list of file types to watch
-    let file_type = event.paths[0].extension().unwrap().to_str().unwrap();
-    let mut is_file_type_in_list = false;
-    for file_type_in_list in file_types.keys() {
-        if file_type_in_list == file_type {
-            is_file_type_in_list = true;
-            break;
+        if let Err(err) = new_file_created(&path, &extension, &matched_dir.file_types) {
+            log::error!("Error: {err:?}");
         }
+    });
+}
+
+fn wait_until_stable(path: &Path, interval: Duration, required_stable_ticks: u32) -> bool {
+    let mut last_size: Option<u64> = None;
+    let mut stable_count = 0;
+    loop {
+        let size = match fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(_) => return false, // gone (renamed/deleted mid-write)
+        };
+        if Some(size) == last_size {
+            stable_count += 1;
+            if stable_count >= required_stable_ticks {
+                return true;
+            }
+        } else {
+            stable_count = 0;
+        }
+        last_size = Some(size);
+        thread::sleep(interval);
     }
-    if !is_file_type_in_list {
-        return Ok(());
-    }
-    // move the file to the directory specified in the config file
-    let file_type = file_types.get(file_type).unwrap();
-    let move_to_dir = Path::new(parent_dir).join(file_type);
+}
+
+fn new_file_created(path: &Path, extension: &str, file_types: &HashMap<String, String>) -> notify::Result<()> {
+    log::info!("New file created: {:?}", path);
+
+    let category = match file_types.get(extension) {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+
+    let parent_dir = match path.parent() {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+
+    let move_to_dir = parent_dir.join(category);
     if !move_to_dir.exists() {
         fs::create_dir_all(move_to_dir.clone()).unwrap();
     }
-    let file_name = event.paths[0].file_name().unwrap();
+    let file_name = match path.file_name() {
+        Some(x) => x,
+        None => return Ok(()),
+    };
     let move_to_dir = move_to_dir.join(file_name);
-    fs::rename(event.paths[0].clone(),move_to_dir.clone()).unwrap();
+    fs::rename(path, move_to_dir).unwrap();
     Ok(())
 }
 
+#[cfg(unix)]
 fn start_daemon() {
     // check if the daemon is already running
     let pid_file = "watch-dir.pid";
@@ -184,12 +272,17 @@ fn start_daemon() {
     }
 }
 
+#[cfg(not(unix))]
+fn start_daemon() {
+    log::info!("Daemonizing not supported on this platform — running in foreground. Use Task Scheduler (Windows) or launchd (macOS) to background this.");
+}
+
 
 fn load_config(){
     let config = "
     config:
   watch:
-    - ~/Downloads
+    - path: ~/Downloads
   file-types:
     documents:
       - pdf
@@ -228,6 +321,16 @@ fn load_config(){
       - m4a
       - aac
       - aiff
+  ignore-extensions:
+    - crdownload
+    - part
+    - download
+    - opdownload
+    - tmp
+    - partial
+  stability:
+    interval-ms: 1000
+    required-stable-ticks: 2
     ";
     let config_path = home_dir().unwrap().join(".config/watch-dir/config.yaml");
     if !config_path.exists() {
