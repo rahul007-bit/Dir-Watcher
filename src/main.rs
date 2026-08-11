@@ -54,6 +54,7 @@ fn main() {
         };
 
         let path = resolve_path(raw_path);
+        let path = fs::canonicalize(&path).unwrap_or(path);
 
         let file_types = if entry["file-types"].is_badvalue() {
             default_file_types.clone()
@@ -171,6 +172,7 @@ fn handle_new_file(event: Event, dirs: &[WatchDir], ignore_extensions: &HashSet<
         Some(x) => x,
         None => return,
     };
+    let parent_dir = fs::canonicalize(parent_dir).unwrap_or_else(|_| parent_dir.to_path_buf());
     let matched_dir = dirs.iter().find(|d| d.path == parent_dir);
     let matched_dir = match matched_dir {
         Some(x) => x.clone(),
@@ -279,8 +281,8 @@ fn start_daemon() {
 
 
 fn load_config(){
-    let config = "
-    config:
+    let config = "\
+config:
   watch:
     - path: ~/Downloads
   file-types:
@@ -331,7 +333,7 @@ fn load_config(){
   stability:
     interval-ms: 1000
     required-stable-ticks: 2
-    ";
+";
     let config_path = home_dir().unwrap().join(".config/watch-dir/config.yaml");
     if !config_path.exists() {
         fs::create_dir_all(home_dir().unwrap().join(".config/watch-dir")).unwrap();
