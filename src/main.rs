@@ -5,7 +5,7 @@ extern crate daemonize_me;
 #[cfg(unix)]
 use daemonize_me::Daemon;
 use home::home_dir;
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event};
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{path::{Path, PathBuf}, fs::{self}, collections::{HashMap, HashSet}, thread, time::Duration};
 #[cfg(unix)]
 use std::{fs::File, process::exit};
@@ -151,7 +151,23 @@ fn watch(dirs: Vec<WatchDir>, ignore_extensions: HashSet<String>, stability: Sta
                         // Windows' backend often reports CreateKind::Any rather than
                         // CreateKind::File, so accept anything but Folder and let
                         // handle_new_file's is_file() check filter the rest.
-                        handle_new_file(event, &dirs, &ignore_extensions, stability);
+                        if let Some(path) = event.paths.into_iter().next() {
+                            handle_new_file(path, &dirs, &ignore_extensions, stability);
+                        }
+                    },
+                    notify::event::EventKind::Modify(notify::event::ModifyKind::Name(rename_mode)) => {
+                        // Browsers finish a download by renaming the temp file
+                        // (foo.mp4.crdownload) to its final name — that's a rename,
+                        // not a Create, so it has to be handled here too.
+                        use notify::event::RenameMode;
+                        let target = match rename_mode {
+                            RenameMode::To => event.paths.into_iter().next(),
+                            RenameMode::Both => event.paths.into_iter().nth(1),
+                            _ => None, // From / Any / Other — nothing new landed here
+                        };
+                        if let Some(path) = target {
+                            handle_new_file(path, &dirs, &ignore_extensions, stability);
+                        }
                     },
                     _ => {}
                 }
@@ -163,8 +179,7 @@ fn watch(dirs: Vec<WatchDir>, ignore_extensions: HashSet<String>, stability: Sta
     Ok(())
 }
 
-fn handle_new_file(event: Event, dirs: &[WatchDir], ignore_extensions: &HashSet<String>, stability: StabilityConfig) {
-    let path = event.paths[0].clone();
+fn handle_new_file(path: PathBuf, dirs: &[WatchDir], ignore_extensions: &HashSet<String>, stability: StabilityConfig) {
 
     if path.is_dir() {
         return;
