@@ -54,3 +54,12 @@ A new file is only moved once its size holds steady for `required-stable-ticks` 
 
 - Linux/macOS: daemonizes and detaches (fork-based).
 - Windows: daemonizing isn't supported (the daemonize crate is Unix-only) — the process runs in the foreground. Background it yourself via Task Scheduler.
+
+## Releases
+
+Pushing a `v*` tag (e.g. `v0.1.0`) triggers `.github/workflows/release.yml`, which cross-compiles Linux and Windows binaries and attaches them to the GitHub release:
+
+```
+git tag v0.1.0
+git push origin v0.1.0
+```
