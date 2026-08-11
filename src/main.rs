@@ -236,14 +236,35 @@ fn new_file_created(path: &Path, extension: &str, file_types: &HashMap<String, S
 
     let move_to_dir = parent_dir.join(category);
     if !move_to_dir.exists() {
-        fs::create_dir_all(move_to_dir.clone()).unwrap();
+        if let Err(err) = fs::create_dir_all(&move_to_dir) {
+            log::error!("Failed to create {move_to_dir:?}: {err:?}");
+            return Ok(());
+        }
     }
     let file_name = match path.file_name() {
         Some(x) => x,
         None => return Ok(()),
     };
     let move_to_dir = move_to_dir.join(file_name);
-    fs::rename(path, move_to_dir).unwrap();
+
+    // On Windows, antivirus/indexer can briefly hold a lock on a just-written
+    // file, making an immediate rename fail with a sharing violation — retry
+    // a few times before giving up.
+    let mut attempt = 0;
+    loop {
+        match fs::rename(path, &move_to_dir) {
+            Ok(()) => break,
+            Err(err) if attempt < 5 => {
+                attempt += 1;
+                thread::sleep(Duration::from_millis(300));
+                log::warn!("Retrying move of {path:?} (attempt {attempt}): {err:?}");
+            }
+            Err(err) => {
+                log::error!("Failed to move {path:?} to {move_to_dir:?}: {err:?}");
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
