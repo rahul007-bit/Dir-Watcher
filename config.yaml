@@ -1,7 +1,7 @@
 config:
   watch:
-    - ~/Downloads
-    # - ~/Desktop
+    - path: ~/Downloads
+    # - path: ~/Desktop
   file-types:
     documents:
       - pdf
@@ -12,6 +12,9 @@ config:
       - ppt
       - pptx
       - txt
+      - md
+      - html
+      - drawio
     images:
       - jpg
       - jpeg
@@ -19,6 +22,9 @@ config:
       - gif
       - tiff
       - bmp
+      - svg
+      - webp
+      - ico
     videos:
       - mp4
       - mov
@@ -40,5 +46,44 @@ config:
       - m4a
       - aac
       - aiff
-
-
+    installers:
+      - exe
+      - msi
+      - iso
+      - dmg
+      - pkg
+      - deb
+      - rpm
+      - appimage
+    archives:
+      - zip
+      - tar
+      - gz
+      - rar
+      - 7z
+      - bz2
+      - xz
+      - tgz
+    code:
+      - yml
+      - yaml
+      - conf
+      - json
+      - js
+      - ts
+      - py
+      - rs
+      - css
+      - sh
+    misc:
+      - winmd
+  ignore-extensions:
+    - crdownload
+    - part
+    - download
+    - opdownload
+    - tmp
+    - partial
+  stability:
+    interval-ms: 1000
+    required-stable-ticks: 2

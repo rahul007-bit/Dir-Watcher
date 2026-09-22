@@ -69,8 +69,28 @@ fn main() {
     let stability = parse_stability(&config["stability"]);
 
     log::info!("Watching {:?}", dirs.iter().map(|d| &d.path).collect::<Vec<_>>());
+    log::info!("Sorting existing files already present in watched directories");
+    scan_existing(&dirs, &ignore_extensions, stability);
     if let Err(error) = watch(dirs, ignore_extensions, stability) {
         log::error!("Error: {error:?}");
+    }
+}
+
+fn scan_existing(dirs: &[WatchDir], ignore_extensions: &HashSet<String>, stability: StabilityConfig) {
+    for dir in dirs.iter() {
+        let entries = match fs::read_dir(&dir.path) {
+            Ok(entries) => entries,
+            Err(err) => {
+                log::warn!("Failed to read {:?}: {err:?}", dir.path);
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                handle_new_file(path, dirs, ignore_extensions, stability);
+            }
+        }
     }
 }
 
@@ -333,6 +353,9 @@ config:
       - ppt
       - pptx
       - txt
+      - md
+      - html
+      - drawio
     images:
       - jpg
       - jpeg
@@ -340,6 +363,9 @@ config:
       - gif
       - tiff
       - bmp
+      - svg
+      - webp
+      - ico
     videos:
       - mp4
       - mov
@@ -361,6 +387,37 @@ config:
       - m4a
       - aac
       - aiff
+    installers:
+      - exe
+      - msi
+      - iso
+      - dmg
+      - pkg
+      - deb
+      - rpm
+      - appimage
+    archives:
+      - zip
+      - tar
+      - gz
+      - rar
+      - 7z
+      - bz2
+      - xz
+      - tgz
+    code:
+      - yml
+      - yaml
+      - conf
+      - json
+      - js
+      - ts
+      - py
+      - rs
+      - css
+      - sh
+    misc:
+      - winmd
   ignore-extensions:
     - crdownload
     - part

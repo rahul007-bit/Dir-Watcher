@@ -16,6 +16,8 @@ cargo build --release
 
 On first run it writes a default config to `~/.config/watch-dir/config.yaml` and daemonizes (Unix only — see Platform notes). Delete `watch-dir.pid` in the working dir if the daemon needs a restart.
 
+On startup it also scans each watched directory once and sorts the files already sitting there, then keeps watching for new ones. Only files directly in the watched directory are scanned — existing category subfolders are left untouched.
+
 ## Config
 
 `~/.config/watch-dir/config.yaml`:
@@ -53,7 +55,33 @@ A new file is only moved once its size holds steady for `required-stable-ticks` 
 ## Platform notes
 
 - Linux/macOS: daemonizes and detaches (fork-based).
-- Windows: daemonizing isn't supported (the daemonize crate is Unix-only) — the process runs in the foreground. Background it yourself via Task Scheduler.
+- Windows: daemonizing isn't supported (the daemonize crate is Unix-only) — the process runs in the foreground.
+
+### Windows autostart
+
+The scripts in `scripts/` register a Scheduled Task that starts the watcher hidden at logon, so it keeps sorting in the background:
+
+```powershell
+# Register the task and start it now (needs an elevated shell)
+sudo pwsh -File scripts\install-autostart.ps1
+
+# Stop the watcher and remove the task
+sudo pwsh -File scripts\uninstall-autostart.ps1
+```
+
+- Task name: `WatchFolder` (runs at logon, hidden, unlimited runtime, restarts on failure).
+- `start-watcher.ps1` is the launcher; run it by hand to start the watcher without registering anything.
+- Logs go to `%LOCALAPPDATA%\watch-folder\watcher.err.log` (`RUST_LOG` controls verbosity, defaults to `info`).
+
+Registering a Scheduled Task requires administrator rights; `sudo` is the Windows 11 built-in elevation helper. If `sudo` isn't enabled, run the same command from an Administrator PowerShell instead.
+
+If the build fails with `linker link.exe not found`, no MSVC toolchain is installed — switch to the bundled MinGW toolchain, which needs no Visual Studio:
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu
+cargo build --release
+```
 
 ## Releases
 
