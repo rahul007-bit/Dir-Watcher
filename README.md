@@ -39,9 +39,11 @@ back, click the tray icon and choose **Show / hide settings**.
 
 Only one instance runs at a time. Launching the app again just shows the
 existing window. If the binary you launch is **newer** than the running one, it
-takes over: it asks the old instance to quit and then starts itself. (The very
-first upgrade away from v0.2.0 needs the old process ended manually, since that
-version had no instance listener.)
+takes over: it asks the old instance to quit, then stops any remaining
+`watch-folder` processes (including pre-v0.2.1 builds that have no instance
+listener) and starts itself. Enabling "Start automatically on login" also
+refreshes the stored path to the current binary, so upgrades don't keep
+launching an old copy.
 
 ### Headless mode
 

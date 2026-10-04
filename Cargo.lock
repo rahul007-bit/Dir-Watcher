@@ -3811,13 +3811,14 @@ dependencies = [
 
 [[package]]
 name = "watch-folder"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "auto-launch",
  "daemonize-me",
  "eframe",
  "env_logger",
  "home",
+ "image",
  "log",
  "notify",
  "opener",

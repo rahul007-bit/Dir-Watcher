@@ -271,10 +271,77 @@ fn bind_instance(tries: u32) -> Option<TcpListener> {
     None
 }
 
+/// Stop any other running watch-folder process.
+///
+/// Older builds (v0.2.0) predate the instance listener, so they can't be asked
+/// to quit over IPC — they have to be terminated by name. This runs only once
+/// we have established ourselves as the primary instance.
+#[cfg(windows)]
+fn kill_other_instances() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let me = std::process::id();
+
+    let output = match std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq watch-folder*", "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            log::warn!("could not enumerate processes: {err}");
+            return;
+        }
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        // CSV: "watch-folder.exe","1234","Console","1","12,345 K"
+        let mut fields = line.split(',');
+        let _name = fields.next();
+        let pid = fields.next().map(|p| p.trim_matches('"'));
+        let Some(pid) = pid.and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        log::info!("stopping old watch-folder process (pid {pid})");
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+}
+
+#[cfg(unix)]
+fn kill_other_instances() {
+    let me = std::process::id().to_string();
+    let output = match std::process::Command::new("pgrep")
+        .args(["-x", "watch-folder"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    for pid in text.split_whitespace() {
+        if pid == me {
+            continue;
+        }
+        log::info!("stopping old watch-folder process (pid {pid})");
+        let _ = std::process::Command::new("kill").args(["-9", pid]).output();
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn kill_other_instances() {}
+
 /// Try to become the primary instance. If another instance is already running,
 /// either take it over (when this binary is newer) or ask it to show its window.
 fn acquire_instance() -> InstanceOutcome {
     if let Some(listener) = bind_instance(20) {
+        kill_other_instances();
         return InstanceOutcome::Primary(listener);
     }
 
@@ -291,6 +358,7 @@ fn acquire_instance() -> InstanceOutcome {
         );
         send_instance_command("REPLACE");
         if let Some(listener) = bind_instance(50) {
+            kill_other_instances();
             return InstanceOutcome::Primary(listener);
         }
         log::warn!("could not take over the instance port; exiting");
@@ -461,6 +529,13 @@ impl App {
             .as_ref()
             .and_then(|a| a.is_enabled().ok())
             .unwrap_or(false);
+        // If autostart is on, re-enable so the entry points at this binary —
+        // otherwise an upgrade would keep launching the old copy at login.
+        if autostart {
+            if let Some(auto) = &auto {
+                let _ = auto.enable();
+            }
+        }
 
         App {
             config,
