@@ -361,6 +361,14 @@ fn acquire_instance() -> InstanceOutcome {
             kill_other_instances();
             return InstanceOutcome::Primary(listener);
         }
+
+        // The running instance didn't release the port (e.g. its listener is
+        // stuck). Stop it by name, then try once more.
+        log::warn!("old instance did not exit on request; stopping it by name");
+        kill_other_instances();
+        if let Some(listener) = bind_instance(50) {
+            return InstanceOutcome::Primary(listener);
+        }
         log::warn!("could not take over the instance port; exiting");
         return InstanceOutcome::AlreadyRunning;
     }
