@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "watch-folder"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "auto-launch",
  "daemonize-me",
@@ -3821,9 +3821,11 @@ dependencies = [
  "log",
  "notify",
  "opener",
+ "raw-window-handle",
  "serde",
  "serde_yaml",
  "tray-icon",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

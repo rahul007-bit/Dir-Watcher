@@ -1,6 +1,6 @@
 [package]
 name = "watch-folder"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,6 +15,10 @@ serde_yaml = "0.9"
 eframe = "0.31"
 auto-launch = "0.6"
 opener = "0.7"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # StatusNotifierItem (D-Bus) backend avoids the GTK/libappindicator build deps.

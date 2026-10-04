@@ -68,10 +68,12 @@ pub fn run() -> Result<(), String> {
         "watch-folder",
         native_options,
         Box::new(move |cc| {
+            configure_style(&cc.egui_ctx);
+            let hwnd = window_handle_isize(cc);
             let tray = create_tray(rgba, width, height)?;
 
             // Listen for other launches (show window / takeover requests).
-            spawn_instance_listener(listener, cc.egui_ctx.clone(), visible.clone());
+            spawn_instance_listener(listener, cc.egui_ctx.clone(), visible.clone(), hwnd);
 
             // Consume tray menu events on a dedicated thread and act on them
             // immediately. This does not depend on egui's repaint loop, so it
@@ -90,6 +92,7 @@ pub fn run() -> Result<(), String> {
                             &paused,
                             &visible,
                             &reload_tx,
+                            hwnd,
                         );
                     }
                 });
@@ -102,6 +105,7 @@ pub fn run() -> Result<(), String> {
                 paused,
                 visible,
                 reload_rx,
+                hwnd,
             )))
         }),
     )
@@ -114,16 +118,13 @@ fn handle_menu_event(
     paused: &Arc<AtomicBool>,
     visible: &Arc<AtomicBool>,
     reload_tx: &Sender<()>,
+    hwnd: isize,
 ) {
     log::info!("tray menu click: {id}");
     match id {
         ID_SHOW => {
             let show = !visible.load(Ordering::SeqCst);
-            visible.store(show, Ordering::SeqCst);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
-            if show {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
+            apply_visibility(show, ctx, hwnd, visible);
         }
         ID_PAUSE => {
             let now_paused = !paused.load(Ordering::SeqCst);
@@ -157,6 +158,98 @@ fn open_path(path: &Path) {
             let _ = opener::open(parent);
         }
     }
+}
+
+fn window_handle_isize(cc: &eframe::CreationContext<'_>) -> isize {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = cc.window_handle() {
+            if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                return win32.hwnd.get();
+            }
+        }
+    }
+    let _ = cc;
+    0
+}
+
+/// Show or hide the window.
+///
+/// Hiding via egui's viewport command stops redraws, which means the matching
+/// "show" command is never processed — so on Windows we drive the OS window
+/// directly, which works even while it is hidden.
+fn apply_visibility(show: bool, ctx: &egui::Context, hwnd: isize, visible: &Arc<AtomicBool>) {
+    visible.store(show, Ordering::SeqCst);
+    os_set_visible(hwnd, show);
+    #[cfg(not(windows))]
+    {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
+        if show {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if show {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+    ctx.request_repaint();
+}
+
+#[cfg(windows)]
+fn os_set_visible(hwnd: isize, show: bool) {
+    if hwnd == 0 {
+        return;
+    }
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW,
+    };
+    let hwnd = hwnd as HWND;
+    unsafe {
+        if show {
+            ShowWindow(hwnd, SW_RESTORE as i32);
+            ShowWindow(hwnd, SW_SHOW as i32);
+            SetForegroundWindow(hwnd);
+        } else {
+            ShowWindow(hwnd, SW_HIDE as i32);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn os_set_visible(_hwnd: isize, _show: bool) {}
+
+/// Brighter, larger text and roomier spacing than the egui defaults.
+fn configure_style(ctx: &egui::Context) {
+    use egui::{Color32, FontId, TextStyle, Visuals};
+
+    let mut visuals = Visuals::dark();
+    visuals.override_text_color = Some(Color32::from_rgb(233, 236, 244));
+    visuals.panel_fill = Color32::from_rgb(23, 25, 32);
+    visuals.window_fill = Color32::from_rgb(23, 25, 32);
+    visuals.faint_bg_color = Color32::from_rgb(31, 34, 43);
+    visuals.extreme_bg_color = Color32::from_rgb(16, 18, 24);
+    visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(196, 202, 214);
+    visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(220, 224, 232);
+    visuals.selection.bg_fill = Color32::from_rgb(59, 130, 246);
+    visuals.hyperlink_color = Color32::from_rgb(120, 170, 255);
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.text_styles = [
+        (TextStyle::Heading, FontId::proportional(22.0)),
+        (TextStyle::Body, FontId::proportional(15.5)),
+        (TextStyle::Monospace, FontId::monospace(14.0)),
+        (TextStyle::Button, FontId::proportional(15.0)),
+        (TextStyle::Small, FontId::proportional(12.5)),
+    ]
+    .into();
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    ctx.set_style(style);
 }
 
 enum InstanceOutcome {
@@ -234,7 +327,12 @@ fn running_version() -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-fn spawn_instance_listener(listener: TcpListener, ctx: egui::Context, visible: Arc<AtomicBool>) {
+fn spawn_instance_listener(
+    listener: TcpListener,
+    ctx: egui::Context,
+    visible: Arc<AtomicBool>,
+    hwnd: isize,
+) {
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let mut buf = [0u8; 128];
@@ -245,10 +343,7 @@ fn spawn_instance_listener(listener: TcpListener, ctx: egui::Context, visible: A
                     let _ = writeln!(stream, "VERSION {CURRENT_VERSION}");
                 }
                 "SHOW" => {
-                    visible.store(true, Ordering::SeqCst);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    ctx.request_repaint();
+                    apply_visibility(true, &ctx, hwnd, &visible);
                 }
                 "REPLACE" => {
                     log::info!("a newer instance is taking over; exiting");
@@ -343,6 +438,7 @@ struct App {
     tray: TrayHandles,
     paused: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
+    hwnd: isize,
     status: String,
     last_tray_status: String,
     auto: Option<AutoLaunch>,
@@ -357,6 +453,7 @@ impl App {
         paused: Arc<AtomicBool>,
         visible: Arc<AtomicBool>,
         reload_rx: Receiver<()>,
+        hwnd: isize,
     ) -> App {
         let draft = Draft::from_config(&config);
         let auto = build_auto_launch();
@@ -373,6 +470,7 @@ impl App {
             tray,
             paused,
             visible,
+            hwnd,
             status: "Watching".to_string(),
             last_tray_status: String::new(),
             auto,
@@ -417,11 +515,7 @@ impl App {
     }
 
     fn set_visible(&mut self, visible: bool, ctx: &egui::Context) {
-        self.visible.store(visible, Ordering::SeqCst);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
-        if visible {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
+        apply_visibility(visible, ctx, self.hwnd, &self.visible);
     }
 
     fn reload_from_disk(&mut self) {
@@ -624,11 +718,16 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.ui_status(ui);
-                self.ui_watch_dirs(ui);
-                self.ui_categories(ui);
-                self.ui_ignore(ui);
-                self.ui_stability(ui);
-                self.ui_startup(ui);
+                ui.add_space(4.0);
+                ui.group(|ui| self.ui_watch_dirs(ui));
+                ui.add_space(6.0);
+                ui.group(|ui| self.ui_categories(ui));
+                ui.add_space(6.0);
+                ui.group(|ui| self.ui_ignore(ui));
+                ui.add_space(6.0);
+                ui.group(|ui| self.ui_stability(ui));
+                ui.add_space(6.0);
+                ui.group(|ui| self.ui_startup(ui));
             });
         });
     }
