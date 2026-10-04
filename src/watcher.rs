@@ -107,8 +107,9 @@ pub fn run_blocking(config: Config) -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
-fn scan_existing(rt: &RuntimeConfig, paused: &Arc<AtomicBool>) {
+fn scan_existing(rt: &RuntimeConfig, paused: &Arc<AtomicBool>) -> usize {
     log::info!("Sorting existing files already present in watched directories");
+    let mut queued = 0;
     for dir in rt.dirs.iter() {
         let entries = match fs::read_dir(&dir.path) {
             Ok(entries) => entries,
@@ -121,9 +122,43 @@ fn scan_existing(rt: &RuntimeConfig, paused: &Arc<AtomicBool>) {
             let path = entry.path();
             if path.is_file() {
                 handle_new_file(path, rt, paused);
+                queued += 1;
             }
         }
     }
+    queued
+}
+
+/// Sort the files already sitting in one watched folder, on demand.
+///
+/// `raw_path` is the path as written in the config (may contain `~`).
+pub fn sort_folder(config: &Config, raw_path: &str) -> usize {
+    let rt = config.to_runtime();
+    let target = crate::config::resolve_path(raw_path);
+    let target = fs::canonicalize(&target).unwrap_or(target);
+
+    let dir = match rt.dirs.iter().find(|d| d.path == target) {
+        Some(dir) => dir.clone(),
+        None => {
+            log::warn!("sort_folder: {target:?} is not a watched folder");
+            return 0;
+        }
+    };
+
+    let single = RuntimeConfig {
+        dirs: vec![dir],
+        ignore_extensions: rt.ignore_extensions,
+        stability: rt.stability,
+    };
+    let paused = Arc::new(AtomicBool::new(false));
+    scan_existing(&single, &paused)
+}
+
+/// Sort the files already sitting in every watched folder, on demand.
+pub fn sort_all(config: &Config) -> usize {
+    let rt = config.to_runtime();
+    let paused = Arc::new(AtomicBool::new(false));
+    scan_existing(&rt, &paused)
 }
 
 fn watch(

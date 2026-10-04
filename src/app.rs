@@ -603,13 +603,21 @@ impl App {
         ui.add_space(4.0);
 
         let mut remove = None;
+        let mut sort_one: Option<String> = None;
         for (i, w) in self.draft.watch.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut w.path)
-                        .desired_width(360.0)
+                        .desired_width(300.0)
                         .hint_text("~/Downloads  |  C:\\Users\\me\\Downloads"),
                 );
+                if ui
+                    .add_enabled(!w.path.trim().is_empty(), egui::Button::new("Sort now"))
+                    .on_hover_text("Sort the files already in this folder")
+                    .clicked()
+                {
+                    sort_one = Some(w.path.clone());
+                }
                 if ui.button("Remove").clicked() {
                     remove = Some(i);
                 }
@@ -625,8 +633,22 @@ impl App {
         if let Some(i) = remove {
             self.draft.watch.remove(i);
         }
-        if ui.button("+ Add folder").clicked() {
-            self.draft.watch.push(DraftWatch::empty());
+
+        ui.horizontal(|ui| {
+            if ui.button("+ Add folder").clicked() {
+                self.draft.watch.push(DraftWatch::empty());
+            }
+            if ui.button("Sort all folders now").clicked() {
+                let config = self.draft.to_config();
+                let n = crate::watcher::sort_all(&config);
+                self.status = format!("Queued {n} file(s) from all folders");
+            }
+        });
+
+        if let Some(path) = sort_one {
+            let config = self.draft.to_config();
+            let n = crate::watcher::sort_folder(&config, &path);
+            self.status = format!("Queued {n} file(s) from {path}");
         }
         ui.separator();
     }

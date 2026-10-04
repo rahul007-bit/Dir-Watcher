@@ -17,8 +17,10 @@ cargo build --release
 
 This starts the tray icon plus the settings window. From the window you can add
 or remove watched folders, edit categories, ignored extensions and the
-stability debounce, and toggle login startup. Closing the window hides it to the
-tray; use **Quit** in the tray menu to actually exit.
+stability debounce, and toggle login startup. Each folder has a **Sort now**
+button to sort its existing files on demand (plus a **Sort all folders now**
+button). Closing the window hides it to the tray; use **Quit** in the tray menu
+to actually exit.
 
 Tray menu:
 

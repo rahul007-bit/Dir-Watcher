@@ -181,8 +181,12 @@ impl Config {
                     Some(custom) => index_file_types(custom),
                     None => default_types.clone(),
                 };
+                // Canonicalize so the stored path matches the canonicalized
+                // parent reported by the watcher (Windows returns `\\?\...`).
+                let path = resolve_path(&entry.path);
+                let path = fs::canonicalize(&path).unwrap_or(path);
                 RuntimeWatch {
-                    path: resolve_path(&entry.path),
+                    path,
                     file_types: types,
                 }
             })
