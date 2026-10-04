@@ -44,7 +44,9 @@ pub fn run() -> Result<(), String> {
     let config = config::load_or_create();
     let paused = Arc::new(AtomicBool::new(false));
     let visible = Arc::new(AtomicBool::new(true));
-    let watcher = Watcher::start_with(config.clone(), paused.clone());
+
+    let (pet_tx, pet_rx) = channel::<crate::pet::PetEvent>();
+    let watcher = Watcher::start_with(config.clone(), paused.clone(), Some(pet_tx.clone()));
 
     let (reload_tx, reload_rx) = channel::<()>();
 
@@ -60,7 +62,8 @@ pub fn run() -> Result<(), String> {
             .with_title("watch-folder")
             .with_inner_size([640.0, 700.0])
             .with_min_inner_size([480.0, 420.0])
-            .with_icon(viewport_icon),
+            .with_icon(viewport_icon)
+            .with_transparent(true),
         ..Default::default()
     };
 
@@ -106,6 +109,8 @@ pub fn run() -> Result<(), String> {
                 visible,
                 reload_rx,
                 hwnd,
+                pet_rx,
+                pet_tx,
             )))
         }),
     )
@@ -203,18 +208,78 @@ fn os_set_visible(hwnd: isize, show: bool) {
     if hwnd == 0 {
         return;
     }
-    use windows_sys::Win32::Foundation::HWND;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use windows_sys::Win32::Foundation::{HWND, RECT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW,
+        GetWindowLongW, GetWindowRect, SetForegroundWindow, SetWindowLongW, SetWindowPos,
+        ShowWindow, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SW_HIDE, SW_RESTORE, SW_SHOW, WS_EX_TOOLWINDOW,
     };
+
+    static SAVED_X: AtomicI32 = AtomicI32::new(100);
+    static SAVED_Y: AtomicI32 = AtomicI32::new(100);
+    static SAVED_W: AtomicI32 = AtomicI32::new(640);
+    static SAVED_H: AtomicI32 = AtomicI32::new(700);
+    static HAS_SAVED: AtomicBool = AtomicBool::new(false);
+
     let hwnd = hwnd as HWND;
     unsafe {
         if show {
+            // Restore normal ex-style (not toolwindow, so it appears in taskbar when open)
+            ShowWindow(hwnd, SW_HIDE as i32);
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_TOOLWINDOW as i32));
+
+            // Restore saved position
+            let x = SAVED_X.load(Ordering::SeqCst);
+            let y = SAVED_Y.load(Ordering::SeqCst);
+            let w = SAVED_W.load(Ordering::SeqCst);
+            let h = SAVED_H.load(Ordering::SeqCst);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                x,
+                y,
+                w,
+                h,
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            );
             ShowWindow(hwnd, SW_RESTORE as i32);
             ShowWindow(hwnd, SW_SHOW as i32);
             SetForegroundWindow(hwnd);
         } else {
+            // Save current position before parking offscreen
+            let mut rect = std::mem::MaybeUninit::<RECT>::uninit();
+            if GetWindowRect(hwnd, rect.as_mut_ptr()) != 0 {
+                let r = rect.assume_init();
+                if r.left > -10000 {
+                    SAVED_X.store(r.left, Ordering::SeqCst);
+                    SAVED_Y.store(r.top, Ordering::SeqCst);
+                    SAVED_W.store((r.right - r.left).max(400), Ordering::SeqCst);
+                    SAVED_H.store((r.bottom - r.top).max(300), Ordering::SeqCst);
+                    HAS_SAVED.store(true, Ordering::SeqCst);
+                }
+            }
+
+            // Hide window first so the Windows Taskbar immediately drops the taskbar button
             ShowWindow(hwnd, SW_HIDE as i32);
+
+            // Set as toolwindow so it does not appear on taskbar or alt-tab when shown
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | (WS_EX_TOOLWINDOW as i32));
+
+            // Park offscreen with SWP_SHOWWINDOW. The window is now shown offscreen as a toolwindow:
+            // the Windows Taskbar NEVER shows a button for it, but Windows OS continues message
+            // pumping for eframe and the desktop companion!
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                -32000,
+                -32000,
+                100,
+                100,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
         }
     }
 }
@@ -519,6 +584,8 @@ struct App {
     last_tray_status: String,
     auto: Option<AutoLaunch>,
     autostart: bool,
+    pet: crate::pet::PetController,
+    pet_tx: Sender<crate::pet::PetEvent>,
 }
 
 impl App {
@@ -530,6 +597,8 @@ impl App {
         visible: Arc<AtomicBool>,
         reload_rx: Receiver<()>,
         hwnd: isize,
+        pet_rx: Receiver<crate::pet::PetEvent>,
+        pet_tx: Sender<crate::pet::PetEvent>,
     ) -> App {
         let draft = Draft::from_config(&config);
         let auto = build_auto_launch();
@@ -545,6 +614,11 @@ impl App {
             }
         }
 
+        let mut pet = crate::pet::PetController::new(Some(pet_rx));
+        pet.enabled = config.pet_enabled;
+        pet.position_offset = config.pet_position_offset;
+        pet.refresh_taskbar_coords();
+
         App {
             config,
             draft,
@@ -558,6 +632,8 @@ impl App {
             last_tray_status: String::new(),
             auto,
             autostart,
+            pet,
+            pet_tx,
         }
     }
 
@@ -605,6 +681,9 @@ impl App {
         let config = config::load_or_create();
         self.watcher.reload(config.clone());
         self.draft = Draft::from_config(&config);
+        self.pet.enabled = config.pet_enabled;
+        self.pet.position_offset = config.pet_position_offset;
+        self.pet.refresh_taskbar_coords();
         self.config = config;
         self.status = "Reloaded config from disk".to_string();
     }
@@ -614,6 +693,9 @@ impl App {
         match config.save() {
             Ok(()) => {
                 self.watcher.reload(config.clone());
+                self.pet.enabled = config.pet_enabled;
+                self.pet.position_offset = config.pet_position_offset;
+                self.pet.refresh_taskbar_coords();
                 self.config = config;
                 self.status = "Saved and restarted watcher".to_string();
             }
@@ -663,7 +745,9 @@ impl App {
             _ => ("Watching", egui::Color32::from_rgb(40, 160, 80)),
         };
         ui.horizontal(|ui| {
-            ui.colored_label(color, format!("● {label}"));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.5, color);
+            ui.colored_label(color, label);
             ui.add_space(8.0);
             let btn = if self.paused.load(Ordering::SeqCst) {
                 "Resume"
@@ -783,6 +867,125 @@ impl App {
             ui.label("Autostart is not available on this platform.");
         }
     }
+
+    fn ui_pet(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Desktop Companion (Mochi Slime)");
+        ui.label("A friendly desktop companion that strolls along your taskbar, picks up new files, and files them into your directory.");
+        ui.add_space(4.0);
+
+        if ui
+            .checkbox(&mut self.draft.pet_enabled, "Enable desktop pet companion")
+            .changed()
+        {
+            self.pet.enabled = self.draft.pet_enabled;
+        }
+
+        if self.pet.enabled {
+            ui.add_space(4.0);
+            let (state_str, state_color) = match self.pet.state {
+                crate::pet::PetState::Sleeping => ("Sleeping near folder zZz", egui::Color32::from_rgb(150, 180, 220)),
+                crate::pet::PetState::Alert => ("Alert! Noticed new file!", egui::Color32::from_rgb(255, 205, 50)),
+                crate::pet::PetState::Collecting => ("Collecting fluttering papers...", egui::Color32::from_rgb(100, 210, 140)),
+                crate::pet::PetState::WalkingToTray => ("Carrying papers to folder...", egui::Color32::from_rgb(100, 210, 140)),
+                crate::pet::PetState::Arranging => ("Sorting files into folder!", egui::Color32::from_rgb(80, 225, 120)),
+                crate::pet::PetState::WalkingHome => ("Returning home to desk...", egui::Color32::from_rgb(150, 180, 220)),
+                crate::pet::PetState::Stuck => ("Stuck! Blocked by files near folder entrance!", egui::Color32::from_rgb(255, 140, 50)),
+            };
+
+            ui.horizontal(|ui| {
+                if let Some(ref textures) = self.pet.textures {
+                    let frame = self.pet.player.current_frame();
+                    let anim_def = match self.pet.state {
+                        crate::pet::PetState::Sleeping => &self.pet.spec.anim_sleep,
+                        crate::pet::PetState::Alert => &self.pet.spec.anim_alert,
+                        crate::pet::PetState::Collecting | crate::pet::PetState::WalkingToTray | crate::pet::PetState::WalkingHome => &self.pet.spec.anim_walk,
+                        crate::pet::PetState::Arranging => &self.pet.spec.anim_drop,
+                        crate::pet::PetState::Stuck => &self.pet.spec.anim_alert,
+                    };
+                    let uv = textures.char_uv(&self.pet.spec, anim_def, frame, self.pet.facing_left);
+                    let img = egui::Image::from_texture(egui::load::SizedTexture::new(
+                        textures.character.id(),
+                        egui::vec2(36.0, 36.0),
+                    ))
+                    .uv(uv);
+                    ui.add(img);
+                }
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Status:");
+                        ui.colored_label(state_color, state_str);
+                    });
+                    ui.label(format!("Speed: {:.0} px/s", self.pet.speed));
+                });
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Stroll speed:");
+                ui.add(egui::Slider::new(&mut self.pet.speed, 15.0..=60.0).suffix(" px/s"));
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Taskbar position:");
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.draft.pet_position_offset, -1000.0..=300.0)
+                            .suffix(" px")
+                            .text("Left <-> Right"),
+                    )
+                    .on_hover_text("Shift Mochi and the folder desk together along the taskbar")
+                    .changed()
+                {
+                    self.pet.position_offset = self.draft.pet_position_offset;
+                    self.pet.refresh_taskbar_coords();
+                    ui.ctx().request_repaint();
+                }
+            });
+            ui.label(
+                egui::RichText::new("Tip: You can also drag & drop Mochi and the folder directly on the taskbar when Mochi is sleeping!")
+                    .italics()
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(160, 180, 210)),
+            );
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Drop test paper")
+                    .on_hover_text("Spawn a falling paper on the desktop to test Mochi")
+                    .clicked()
+                {
+                    let _ = self.pet_tx.send(crate::pet::PetEvent::NewFile("sample_notes.pdf".to_string()));
+                    ui.ctx().request_repaint();
+                }
+                if ui
+                    .button("Help Mochi clean")
+                    .on_hover_text("Clear all papers and celebrate with Mochi")
+                    .clicked()
+                {
+                    self.pet.help_clean();
+                    ui.ctx().request_repaint();
+                }
+                if ui
+                    .button("Say hi")
+                    .on_hover_text("Make Mochi say a friendly line")
+                    .clicked()
+                {
+                    self.pet.say_funny("yoo bro! ready to sort files!", 3.0);
+                    ui.ctx().request_repaint();
+                }
+                if ui
+                    .button("Realign to taskbar")
+                    .on_hover_text("Refresh screen and taskbar bounds")
+                    .clicked()
+                {
+                    self.pet.refresh_taskbar_coords();
+                    ui.ctx().request_repaint();
+                }
+            });
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -801,40 +1004,60 @@ impl eframe::App for App {
 
         self.sync_tray();
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Revert").clicked() {
-                        self.draft = Draft::from_config(&self.config);
-                        self.status = "Reverted unsaved changes".to_string();
-                    }
-                    let dirty = self.is_dirty();
-                    if ui
-                        .add_enabled(dirty, egui::Button::new("Save & apply"))
-                        .clicked()
-                    {
-                        self.save_and_apply();
-                    }
+        // Update and render desktop companion
+        if self.pet.enabled {
+            let delay = self.pet.update();
+            ctx.request_repaint_after(delay);
+            self.pet.render(ctx);
+
+            // Sync dragged position from desktop to draft settings
+            if self.pet.is_dragging_desk {
+                self.draft.pet_position_offset = self.pet.position_offset;
+            }
+        }
+
+        let is_visible = self.visible.load(Ordering::SeqCst);
+        if is_visible {
+            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(&self.status);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Revert").clicked() {
+                            self.draft = Draft::from_config(&self.config);
+                            self.pet.enabled = self.config.pet_enabled;
+                            self.pet.position_offset = self.config.pet_position_offset;
+                            self.pet.refresh_taskbar_coords();
+                            self.status = "Reverted unsaved changes".to_string();
+                        }
+                        let dirty = self.is_dirty();
+                        if ui
+                            .add_enabled(dirty, egui::Button::new("Save & apply"))
+                            .clicked()
+                        {
+                            self.save_and_apply();
+                        }
+                    });
                 });
             });
-        });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                self.ui_status(ui);
-                ui.add_space(4.0);
-                ui.group(|ui| self.ui_watch_dirs(ui));
-                ui.add_space(6.0);
-                ui.group(|ui| self.ui_categories(ui));
-                ui.add_space(6.0);
-                ui.group(|ui| self.ui_ignore(ui));
-                ui.add_space(6.0);
-                ui.group(|ui| self.ui_stability(ui));
-                ui.add_space(6.0);
-                ui.group(|ui| self.ui_startup(ui));
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.ui_status(ui);
+                    ui.add_space(4.0);
+                    ui.group(|ui| self.ui_pet(ui));
+                    ui.add_space(6.0);
+                    ui.group(|ui| self.ui_watch_dirs(ui));
+                    ui.add_space(6.0);
+                    ui.group(|ui| self.ui_categories(ui));
+                    ui.add_space(6.0);
+                    ui.group(|ui| self.ui_ignore(ui));
+                    ui.add_space(6.0);
+                    ui.group(|ui| self.ui_stability(ui));
+                    ui.add_space(6.0);
+                    ui.group(|ui| self.ui_startup(ui));
+                });
             });
-        });
+        }
     }
 }
 
@@ -847,7 +1070,7 @@ fn category_editor(ui: &mut egui::Ui, pairs: &mut Vec<(String, String)>) {
                     .desired_width(120.0)
                     .hint_text("category"),
             );
-            ui.label("→");
+            ui.label("=>");
             ui.add(
                 egui::TextEdit::singleline(exts)
                     .desired_width(340.0)
@@ -889,6 +1112,8 @@ struct Draft {
     ignore: String,
     interval_ms: u64,
     required_ticks: u32,
+    pet_enabled: bool,
+    pet_position_offset: f32,
 }
 
 impl Draft {
@@ -912,6 +1137,8 @@ impl Draft {
             ignore: config.ignore_extensions.join(", "),
             interval_ms: config.stability.interval_ms,
             required_ticks: config.stability.required_stable_ticks,
+            pet_enabled: config.pet_enabled,
+            pet_position_offset: config.pet_position_offset,
         }
     }
 
@@ -936,6 +1163,8 @@ impl Draft {
                 interval_ms: self.interval_ms,
                 required_stable_ticks: self.required_ticks,
             },
+            pet_enabled: self.pet_enabled,
+            pet_position_offset: self.pet_position_offset,
         }
     }
 }

@@ -18,6 +18,18 @@ pub struct Config {
     pub ignore_extensions: Vec<String>,
     #[serde(default)]
     pub stability: Stability,
+    #[serde(rename = "pet-enabled", default = "default_pet_enabled")]
+    pub pet_enabled: bool,
+    #[serde(rename = "pet-position-offset", default = "default_pet_position_offset")]
+    pub pet_position_offset: f32,
+}
+
+fn default_pet_enabled() -> bool {
+    true
+}
+
+fn default_pet_position_offset() -> f32 {
+    0.0
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -112,6 +124,8 @@ impl Default for Config {
                 .map(|s| s.to_string())
                 .collect(),
             stability: Stability::default(),
+            pet_enabled: true,
+            pet_position_offset: 0.0,
         }
     }
 }

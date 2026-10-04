@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod headless;
+mod pet;
 mod watcher;
 
 fn main() {

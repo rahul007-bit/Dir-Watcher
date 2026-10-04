@@ -2,7 +2,7 @@ use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -30,12 +30,17 @@ pub struct Watcher {
     paused: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    pet_tx: Option<Sender<crate::pet::PetEvent>>,
 }
 
 impl Watcher {
     /// Start the watcher using a caller-provided pause flag, so other parts of
     /// the app (e.g. the tray menu) can pause/resume it directly.
-    pub fn start_with(config: Config, paused: Arc<AtomicBool>) -> Watcher {
+    pub fn start_with(
+        config: Config,
+        paused: Arc<AtomicBool>,
+        pet_tx: Option<Sender<crate::pet::PetEvent>>,
+    ) -> Watcher {
         let stop = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
 
@@ -44,13 +49,14 @@ impl Watcher {
             let stop = stop.clone();
             let paused = paused.clone();
             let running = running.clone();
+            let pet_tx = pet_tx.clone();
             thread::spawn(move || {
                 log::info!(
                     "Watching {:?}",
                     rt.dirs.iter().map(|d| &d.path).collect::<Vec<_>>()
                 );
                 scan_existing(&rt, &paused);
-                if let Err(err) = watch(rt, stop, paused) {
+                if let Err(err) = watch(rt, stop, paused, pet_tx) {
                     log::error!("Watcher stopped: {err:?}");
                 }
                 running.store(false, Ordering::SeqCst);
@@ -62,6 +68,7 @@ impl Watcher {
             paused,
             running,
             join: Some(join),
+            pet_tx,
         }
     }
 
@@ -73,8 +80,9 @@ impl Watcher {
     /// (shared) pause flag.
     pub fn reload(&mut self, config: Config) {
         let paused = self.paused.clone();
+        let pet_tx = self.pet_tx.clone();
         self.shutdown();
-        *self = Watcher::start_with(config, paused);
+        *self = Watcher::start_with(config, paused, pet_tx);
     }
 
     fn shutdown(&mut self) {
@@ -103,7 +111,7 @@ pub fn run_blocking(config: Config) -> io::Result<()> {
     );
     let paused = Arc::new(AtomicBool::new(false));
     scan_existing(&rt, &paused);
-    watch(rt, Arc::new(AtomicBool::new(false)), paused)
+    watch(rt, Arc::new(AtomicBool::new(false)), paused, None)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
@@ -121,7 +129,7 @@ fn scan_existing(rt: &RuntimeConfig, paused: &Arc<AtomicBool>) -> usize {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-                handle_new_file(path, rt, paused);
+                handle_new_file(path, rt, paused, None);
                 queued += 1;
             }
         }
@@ -165,6 +173,7 @@ fn watch(
     rt: RuntimeConfig,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    pet_tx: Option<Sender<crate::pet::PetEvent>>,
 ) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default())?;
@@ -189,7 +198,7 @@ fn watch(
                         // CreateKind::File, so accept anything but Folder and let
                         // handle_new_file's is_file() check filter the rest.
                         if let Some(path) = event.paths.into_iter().next() {
-                            handle_new_file(path, &rt, &paused);
+                            handle_new_file(path, &rt, &paused, pet_tx.as_ref());
                         }
                     }
                     notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
@@ -205,7 +214,7 @@ fn watch(
                             _ => None, // From / Any / Other — nothing new landed here
                         };
                         if let Some(path) = target {
-                            handle_new_file(path, &rt, &paused);
+                            handle_new_file(path, &rt, &paused, pet_tx.as_ref());
                         }
                     }
                     _ => {}
@@ -220,7 +229,12 @@ fn watch(
     Ok(())
 }
 
-fn handle_new_file(path: PathBuf, rt: &RuntimeConfig, paused: &Arc<AtomicBool>) {
+fn handle_new_file(
+    path: PathBuf,
+    rt: &RuntimeConfig,
+    paused: &Arc<AtomicBool>,
+    pet_tx: Option<&Sender<crate::pet::PetEvent>>,
+) {
     if paused.load(Ordering::SeqCst) {
         return;
     }
@@ -247,6 +261,15 @@ fn handle_new_file(path: PathBuf, rt: &RuntimeConfig, paused: &Arc<AtomicBool>) 
 
     if rt.ignore_extensions.contains(&extension) {
         return;
+    }
+
+    // If the file matches a configured category, notify the desktop pet companion
+    if matched_dir.file_types.contains_key(&extension) {
+        if let Some(tx) = pet_tx {
+            if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+                let _ = tx.send(crate::pet::PetEvent::NewFile(file_name.to_string()));
+            }
+        }
     }
 
     let stability = rt.stability;
