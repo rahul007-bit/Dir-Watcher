@@ -28,14 +28,118 @@ const ID_QUIT: &str = "watch-folder.quit";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Loopback port used for single-instance detection and takeover.
 const INSTANCE_PORT: u16 = 49717;
+/// Passed to the binary by the autostart entry so it starts hidden (tray only).
+const AUTOSTART_ARG: &str = "--autostart";
+
+fn has_arg(name: &str) -> bool {
+    std::env::args().any(|a| a == name)
+}
+
+fn home_dir() -> std::path::PathBuf {
+    home::home_dir().expect("could not determine home directory")
+}
+
+/// Where an installed copy lives.
+fn install_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let path = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home_dir().join("AppData/Local"))
+        .join("Programs/watch-folder/watch-folder.exe");
+    #[cfg(target_os = "macos")]
+    let path = home_dir().join("Applications/watch-folder");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let path = home_dir().join(".local/bin/watch-folder");
+    #[cfg(not(any(windows, target_os = "macos", unix)))]
+    let path = home_dir().join("watch-folder");
+    path
+}
+
+fn installed_marker() -> std::path::PathBuf {
+    home_dir().join(".config/watch-dir/installed")
+}
+
+fn read_installed_version() -> Option<String> {
+    std::fs::read_to_string(installed_marker())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Copy this executable to the install location (retrying in case an old copy
+/// was just terminated and the file is briefly locked on Windows).
+fn install_self() -> std::io::Result<std::path::PathBuf> {
+    let target = install_path();
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let current = std::env::current_exe()?;
+    if current == target {
+        let _ = std::fs::write(installed_marker(), CURRENT_VERSION);
+        return Ok(target);
+    }
+
+    let mut last_err = None;
+    for _ in 0..8 {
+        match std::fs::copy(&current, &target) {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(300));
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+
+    let _ = std::fs::write(installed_marker(), CURRENT_VERSION);
+    Ok(target)
+}
+
+fn auto_launch_for(path: &Path) -> Option<AutoLaunch> {
+    let path = path.to_string_lossy().to_string();
+    let mut builder = AutoLaunchBuilder::new();
+    builder
+        .set_app_name("watch-folder")
+        .set_app_path(&path)
+        .set_args(&[AUTOSTART_ARG]);
+    #[cfg(target_os = "linux")]
+    builder.set_linux_launch_mode(LinuxLaunchMode::XdgAutostart);
+    builder
+        .build()
+        .map_err(|e| log::warn!("autostart unavailable: {e}"))
+        .ok()
+}
 
 /// Start the tray application with its egui settings window.
 ///
 /// Returns an error if the tray icon or the windowing system is unavailable,
 /// so the caller can fall back to headless mode.
 pub fn run() -> Result<(), String> {
-    // Only one instance may run. A newer binary replaces an older running one;
-    // an equal/older binary just asks the running one to show its window.
+    let autostart_launch = has_arg(AUTOSTART_ARG);
+    let force_install = has_arg("--install");
+    let force_test_run = has_arg("--test-run");
+
+    let own = CURRENT_VERSION;
+    let running = running_version();
+
+    // If an equal/newer instance is already running, surface it and stop.
+    if let Some(running_version) = &running {
+        if !version_gt(own, running_version) {
+            if !autostart_launch {
+                log::info!("v{running_version} already running; showing it");
+                send_instance_command("SHOW");
+            }
+            return Ok(());
+        }
+        log::info!("running instance v{running_version} is older than v{own}");
+    }
+
+    // Only one instance may run. A newer binary replaces an older running one.
     let listener = match acquire_instance() {
         InstanceOutcome::Primary(listener) => listener,
         InstanceOutcome::AlreadyRunning => return Ok(()),
@@ -43,12 +147,28 @@ pub fn run() -> Result<(), String> {
 
     let config = config::load_or_create();
     let paused = Arc::new(AtomicBool::new(false));
-    let visible = Arc::new(AtomicBool::new(true));
+    let visible = Arc::new(AtomicBool::new(!autostart_launch));
 
     let (pet_tx, pet_rx) = channel::<crate::pet::PetEvent>();
     let watcher = Watcher::start_with(config.clone(), paused.clone(), Some(pet_tx.clone()));
 
     let (reload_tx, reload_rx) = channel::<()>();
+
+    let is_installed_self = std::env::current_exe()
+        .map(|p| p == install_path())
+        .unwrap_or(false);
+    let installed = read_installed_version();
+    let current_version = running.clone().or(installed);
+
+    // Ask to install / test-run when this binary is newer than what's around.
+    let need_prompt = !autostart_launch
+        && !force_install
+        && !force_test_run
+        && !is_installed_self
+        && match &current_version {
+            Some(version) => version_gt(own, version),
+            None => true,
+        };
 
     let (rgba, width, height) = icon_rgba(64);
     let viewport_icon = egui::IconData {
@@ -62,6 +182,7 @@ pub fn run() -> Result<(), String> {
             .with_title("watch-folder")
             .with_inner_size([640.0, 700.0])
             .with_min_inner_size([480.0, 420.0])
+            .with_visible(!autostart_launch)
             .with_icon(viewport_icon)
             .with_transparent(true),
         ..Default::default()
@@ -111,6 +232,9 @@ pub fn run() -> Result<(), String> {
                 hwnd,
                 pet_rx,
                 pet_tx,
+                need_prompt,
+                force_install,
+                current_version,
             )))
         }),
     )
@@ -571,6 +695,12 @@ fn create_tray(
     })
 }
 
+#[derive(PartialEq)]
+enum Stage {
+    Prompt,
+    Running,
+}
+
 struct App {
     config: Config,
     draft: Draft,
@@ -586,9 +716,14 @@ struct App {
     autostart: bool,
     pet: crate::pet::PetController,
     pet_tx: Sender<crate::pet::PetEvent>,
+    stage: Stage,
+    own_version: &'static str,
+    current_version: Option<String>,
+    do_install: bool,
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: Config,
         watcher: Watcher,
@@ -599,6 +734,9 @@ impl App {
         hwnd: isize,
         pet_rx: Receiver<crate::pet::PetEvent>,
         pet_tx: Sender<crate::pet::PetEvent>,
+        need_prompt: bool,
+        force_install: bool,
+        current_version: Option<String>,
     ) -> App {
         let draft = Draft::from_config(&config);
         let auto = build_auto_launch();
@@ -634,7 +772,69 @@ impl App {
             autostart,
             pet,
             pet_tx,
+            stage: if need_prompt {
+                Stage::Prompt
+            } else {
+                Stage::Running
+            },
+            own_version: CURRENT_VERSION,
+            current_version,
+            do_install: force_install,
         }
+    }
+
+    /// Copy this binary into the install location and point autostart at it.
+    fn run_install(&mut self) {
+        match install_self() {
+            Ok(target) => {
+                log::info!("installed to {target:?}");
+                self.auto = auto_launch_for(&target);
+                if let Some(auto) = &self.auto {
+                    let _ = auto.enable();
+                    self.autostart = auto.is_enabled().unwrap_or(true);
+                }
+                self.status = format!("Installed to {}", target.display());
+            }
+            Err(err) => self.status = format!("Install failed: {err}"),
+        }
+    }
+
+    fn ui_prompt(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(60.0);
+                ui.heading("watch-folder");
+                ui.add_space(10.0);
+                match &self.current_version {
+                    Some(current) => {
+                        ui.label(format!("You have v{current}. This is v{}.", self.own_version));
+                        ui.label("Install this version (and start it on login)?");
+                    }
+                    None => {
+                        ui.label(format!("Install watch-folder v{}?", self.own_version));
+                        ui.label("Installs to your user folder and starts it on login.");
+                    }
+                }
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Install").clicked() {
+                        self.do_install = true;
+                        self.stage = Stage::Running;
+                    }
+                    if ui
+                        .button("Test run")
+                        .on_hover_text("Run without installing")
+                        .clicked()
+                    {
+                        self.do_install = false;
+                        self.stage = Stage::Running;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        std::process::exit(0);
+                    }
+                });
+            });
+        });
     }
 
     fn status_label(&self) -> &'static str {
@@ -990,6 +1190,16 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.stage == Stage::Prompt {
+            self.ui_prompt(ctx);
+            return;
+        }
+
+        if self.do_install {
+            self.do_install = false;
+            self.run_install();
+        }
+
         // "Reload config" is the one action that needs our own state; the rest
         // are handled directly in the tray event handler.
         if self.reload_rx.try_recv().is_ok() {
@@ -1192,18 +1402,13 @@ fn split_list(value: &str) -> Vec<String> {
 }
 
 fn build_auto_launch() -> Option<AutoLaunch> {
-    let exe = std::env::current_exe().ok()?;
-    let path = exe.to_string_lossy().to_string();
-
-    let mut builder = AutoLaunchBuilder::new();
-    builder.set_app_name("watch-folder").set_app_path(&path);
-    #[cfg(target_os = "linux")]
-    builder.set_linux_launch_mode(LinuxLaunchMode::XdgAutostart);
-
-    builder
-        .build()
-        .map_err(|e| log::warn!("autostart unavailable: {e}"))
-        .ok()
+    let installed = install_path();
+    let target = if installed.exists() {
+        installed
+    } else {
+        std::env::current_exe().unwrap_or(installed)
+    };
+    auto_launch_for(&target)
 }
 
 /// Draw a simple folder icon so no binary asset is needed.

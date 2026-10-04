@@ -35,6 +35,23 @@ Tray menu:
 Closing the window keeps the watcher running in the tray. To get the window
 back, click the tray icon and choose **Show / hide settings**.
 
+### Install & update
+
+Run the downloaded executable. It compares its own version with the running
+instance:
+
+- If it is **older**, it does nothing (the newer running copy stays).
+- If it is **newer** — or nothing is installed yet — it shows a prompt:
+  - **Install** — copies the exe to `%LOCALAPPDATA%\Programs\watch-folder`
+    (Windows), `~/.local/bin/watch-folder` (Linux) or `~/Applications/watch-folder`
+    (macOS), and enables autostart for the installed copy.
+  - **Test run** — runs without installing.
+  - **Cancel** — exits.
+
+Once installed, the installed copy starts **hidden in the tray only** at login
+(the settings window does not pop up). Use `--install` or `--test-run` to skip
+the prompt.
+
 ### Single instance
 
 Only one instance runs at a time. Launching the app again just shows the
