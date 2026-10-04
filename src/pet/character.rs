@@ -9,6 +9,7 @@ pub enum CharacterKind {
     #[default]
     Slime,
     Neko,
+    Oneko,
     Dog,
 }
 
@@ -16,7 +17,8 @@ impl CharacterKind {
     pub fn display_name(&self) -> &'static str {
         match self {
             CharacterKind::Slime => "White Mochi Slime",
-            CharacterKind::Neko => "Pixel Neko",
+            CharacterKind::Neko => "Pixel Neko (Calico)",
+            CharacterKind::Oneko => "Classic Oneko (1989)",
             CharacterKind::Dog => "Shiba Inu",
         }
     }
@@ -54,6 +56,8 @@ pub struct CharacterSpec {
 
 // Embedded assets
 pub const SLIME_SHEET: &[u8] = include_bytes!("../../assets/pet/slime_white_mochi.png");
+pub const NEKO_SHEET: &[u8] = include_bytes!("../../assets/pet/neko.png");
+pub const ONEKO_SHEET: &[u8] = include_bytes!("../../assets/pet/oneko.png");
 pub const FILE_ICON: &[u8] = include_bytes!("../../assets/pet/paper_realistic.png");
 pub const ZZZ_SHEET: &[u8] = include_bytes!("../../assets/pet/zzz_particles.png");
 pub const FOLDER_SLOT: &[u8] = include_bytes!("../../assets/pet/folder_slot.png");
@@ -62,7 +66,8 @@ impl CharacterSpec {
     pub fn for_kind(kind: CharacterKind) -> Self {
         match kind {
             CharacterKind::Slime => Self::slime(),
-            CharacterKind::Neko => Self::neko_placeholder(),
+            CharacterKind::Neko => Self::neko(),
+            CharacterKind::Oneko => Self::oneko(),
             CharacterKind::Dog => Self::dog_placeholder(),
         }
     }
@@ -118,11 +123,106 @@ impl CharacterSpec {
         }
     }
 
-    /// Neko placeholder fallback to slime until Neko sprite pack is integrated
-    fn neko_placeholder() -> Self {
-        let mut spec = Self::slime();
-        spec.kind = CharacterKind::Neko;
-        spec
+    /// Pixel Neko layout (Japanese Calico cat, 32x32 frames, 10 frames per row):
+    /// Row 0: Idle (10 frames) - sitting loaf, ear twitches, blinking, tail swishes
+    /// Row 1: Alert (10 frames) - startled ears, crouch, playful pounce hop with '!'
+    /// Row 2: Walk (10 frames) - 4-legged feline trot/prowl, bouncy tail, jingle bell
+    /// Row 3: Drop / Toss (10 frames) - playful two-paw swat into folder, paw lick
+    /// Row 4: Sleep (10 frames) - curled-up cozy cat loaf, wrapped tail, rhythmic breathing
+    pub fn neko() -> Self {
+        Self {
+            kind: CharacterKind::Neko,
+            frame_width: 32,
+            frame_height: 32,
+            sheet_bytes: NEKO_SHEET,
+            carry_offset: (0.0, -18.0),
+            anim_idle: AnimationDef {
+                row: 0,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 140,
+                loops: true,
+            },
+            anim_alert: AnimationDef {
+                row: 1,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 70,
+                loops: false,
+            },
+            anim_walk: AnimationDef {
+                row: 2,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 90,
+                loops: true,
+            },
+            anim_drop: AnimationDef {
+                row: 3,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 85,
+                loops: false,
+            },
+            anim_sleep: AnimationDef {
+                row: 4,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 220,
+                loops: true,
+            },
+        }
+    }
+
+    /// Classic Oneko layout (1989 X11 cat by Masayuki Koba, 32x32 frames, 10 frames per row):
+    /// Row 0: Idle (10 frames) - sit, paw lick, ear scratch, yawn
+    /// Row 1: Alert (10 frames) - surprised (!) alert, hop, ready stance
+    /// Row 2: Walk (10 frames) - classic retro 2-step run cycle (8 FPS)
+    /// Row 3: Drop / Toss / Scratch (10 frames) - upward clawing & scratch, paw wash
+    /// Row 4: Sleep (10 frames) - curled up sleeping cat with alternating Zzz
+    pub fn oneko() -> Self {
+        Self {
+            kind: CharacterKind::Oneko,
+            frame_width: 32,
+            frame_height: 32,
+            sheet_bytes: ONEKO_SHEET,
+            carry_offset: (0.0, -18.0),
+            anim_idle: AnimationDef {
+                row: 0,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 180,
+                loops: true,
+            },
+            anim_alert: AnimationDef {
+                row: 1,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 90,
+                loops: false,
+            },
+            anim_walk: AnimationDef {
+                row: 2,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 125, // 8 FPS
+                loops: true,
+            },
+            anim_drop: AnimationDef {
+                row: 3,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 90,
+                loops: false,
+            },
+            anim_sleep: AnimationDef {
+                row: 4,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 250,
+                loops: true,
+            },
+        }
     }
 
     /// Dog placeholder fallback

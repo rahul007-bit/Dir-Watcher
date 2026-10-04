@@ -104,6 +104,18 @@ fn fallback_taskbar_info() -> Option<TaskbarInfo> {
     }
 }
 
+#[cfg(not(windows))]
+pub fn get_taskbar_info() -> Option<TaskbarInfo> {
+    let bounds = Rect {
+        left: 0,
+        top: 720,
+        right: 1280,
+        bottom: 768,
+    };
+    let tray_target = (1160.0, 744.0);
+    Some(TaskbarInfo { bounds, tray_target })
+}
+
 #[cfg(windows)]
 pub fn apply_pet_window_transparency(title: &str) -> bool {
     use std::sync::atomic::{AtomicIsize, Ordering};
@@ -136,6 +148,11 @@ pub fn apply_pet_window_transparency(title: &str) -> bool {
             return true;
         }
     }
+    false
+}
+
+#[cfg(not(windows))]
+pub fn apply_pet_window_transparency(_title: &str) -> bool {
     false
 }
 

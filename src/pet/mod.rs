@@ -1,4 +1,5 @@
 //! Desktop companion (Pet) controller and state machine.
+#![allow(dead_code)]
 
 pub mod animation;
 pub mod character;
@@ -161,6 +162,17 @@ impl PetController {
         }
     }
 
+    pub fn new_with_kind(rx: Option<Receiver<PetEvent>>, kind: CharacterKind) -> Self {
+        let mut pet = Self::new(rx);
+        pet.set_character(kind);
+        pet
+    }
+
+    pub fn set_character(&mut self, kind: CharacterKind) {
+        self.spec = CharacterSpec::for_kind(kind);
+        self.textures = None; // Invalidate so textures reload with character sheet
+    }
+
     fn pseudo_random(&mut self, min: f32, max: f32) -> f32 {
         self.random_seed = self.random_seed.wrapping_mul(1664525).wrapping_add(1013904223);
         let normalized = (self.random_seed as f32) / (u32::MAX as f32);
@@ -178,8 +190,18 @@ impl PetController {
             return;
         }
 
-        let quotes: &[&str] = match context {
-            DialogueContext::Stuck => &[
+        let is_cat = matches!(self.spec.kind, CharacterKind::Neko | CharacterKind::Oneko);
+
+        let quotes: &[&str] = match (context, is_cat) {
+            (DialogueContext::Stuck, true) => &[
+                "Nyaa! I'm stuck, help meow!",
+                "Who blocked my path nya?!",
+                "Neko paws can't jump over this file!",
+                "bro i am stuck see naah nya!",
+                "Meoww! Path blocked, send help!",
+                "Human! Clear the folder slot for meow!",
+            ],
+            (DialogueContext::Stuck, false) => &[
                 "bro i am stuck see naah",
                 "yoo bro where are you",
                 "bro someone left a file in my way",
@@ -192,7 +214,15 @@ impl PetController {
                 "Boss! Clear the doorway with Help button!",
                 "Traffic jam at the folder! Send help!",
             ],
-            DialogueContext::Helped => &[
+            (DialogueContext::Helped, true) => &[
+                "Nyaa~ thank you!",
+                "Purrrr... thanks bro!",
+                "Good human! *happy tail swish*",
+                "Filed and purr-fect!",
+                "Arigato! Teamwork nya!",
+                "Purr... desk is sparkling clean!",
+            ],
+            (DialogueContext::Helped, false) => &[
                 "thaks man!",
                 "yoo thanks bro!",
                 "saved me there, thanks man",
