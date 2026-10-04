@@ -1,6 +1,7 @@
 # watch-folder
 
-Daemon that watches directories and sorts new files into subfolders by extension.
+Watches directories and sorts new files into subfolders by extension, with a
+system tray icon and a settings window.
 
 ## Build
 
@@ -14,9 +15,39 @@ cargo build --release
 ./target/release/watch-folder
 ```
 
-On first run it writes a default config to `~/.config/watch-dir/config.yaml` and daemonizes (Unix only — see Platform notes). Delete `watch-dir.pid` in the working dir if the daemon needs a restart.
+This starts the tray icon plus the settings window. From the window you can add
+or remove watched folders, edit categories, ignored extensions and the
+stability debounce, and toggle login startup. Closing the window hides it to the
+tray; use **Quit** in the tray menu to actually exit.
 
-On startup it also scans each watched directory once and sorts the files already sitting there, then keeps watching for new ones. Only files directly in the watched directory are scanned — existing category subfolders are left untouched.
+Tray menu:
+
+- **Show / hide settings** — toggle the window
+- **Pause / resume** — stop/continue moving files
+- **Reload config** — re-read the YAML from disk
+- **Open config file** / **Open logs**
+- **Quit**
+
+### Headless mode
+
+For servers or machines without a tray:
+
+```
+./target/release/watch-folder --headless
+```
+
+On Linux/macOS this daemonizes (detaches) and writes a `watch-dir.pid` in the
+working dir; on Windows there is no daemon support, so it runs in the
+foreground. If no display/session bus is available, the app starts headless
+automatically.
+
+On first run it writes a default config to `~/.config/watch-dir/config.yaml`.
+Logs go to `~/.config/watch-dir/watcher.log` (`RUST_LOG` controls verbosity,
+defaults to `info`).
+
+On startup it also scans each watched directory once and sorts the files already
+sitting there, then keeps watching for new ones. Only files directly in the
+watched directory are scanned — existing category subfolders are left untouched.
 
 ## Config
 
@@ -48,46 +79,54 @@ config:
     required-stable-ticks: 2
 ```
 
-Each `watch` entry is a directory; give it its own `file-types` block to sort it differently from the default. Extension matching is case-insensitive.
+Each `watch` entry is a directory; give it its own `file-types` block to sort it
+differently from the default. Extension matching is case-insensitive.
 
-A new file is only moved once its size holds steady for `required-stable-ticks` consecutive polls (`interval-ms` apart) — protects in-progress downloads/copies from being moved mid-write. Files with an ignored extension, or no extension/category match, are left alone.
+A new file is only moved once its size holds steady for `required-stable-ticks`
+consecutive polls (`interval-ms` apart) — protects in-progress downloads/copies
+from being moved mid-write. Files with an ignored extension, or no
+extension/category match, are left alone.
 
-## Platform notes
+## Autostart
 
-- Linux/macOS: daemonizes and detaches (fork-based).
-- Windows: daemonizing isn't supported (the daemonize crate is Unix-only) — the process runs in the foreground.
+Use **Start automatically on login** in the settings window. This uses the
+platform's native mechanism:
 
-### Windows autostart
+- **Linux/BSD**: an XDG autostart `.desktop` file in `~/.config/autostart/`
+- **Windows**: a `HKCU\...\CurrentVersion\Run` registry entry
+- **macOS**: a `LaunchAgent` plist
 
-The scripts in `scripts/` register a Scheduled Task that starts the watcher hidden at logon, so it keeps sorting in the background:
+The `scripts/*.ps1` Scheduled Task from earlier versions still works but is now
+legacy — use either the in-app toggle or the scripts, not both.
 
-```powershell
-# Register the task and start it now (needs an elevated shell)
-sudo pwsh -File scripts\install-autostart.ps1
+## Linux tray notes
 
-# Stop the watcher and remove the task
-sudo pwsh -File scripts\uninstall-autostart.ps1
-```
+- The tray uses StatusNotifierItem (D-Bus); there are **no** GTK or
+  libappindicator build dependencies.
+- KDE Plasma, XFCE, Cinnamon, MATE, Budgie and similar desktops show it
+  natively.
+- Stock **GNOME hides tray icons**. Install the *AppIndicator and
+  KStatusNotifierItem Support* GNOME extension, or run with `--headless`.
 
-- Task name: `WatchFolder` (runs at logon, hidden, unlimited runtime, restarts on failure).
-- `start-watcher.ps1` is the launcher; run it by hand to start the watcher without registering anything.
-- Logs go to `%LOCALAPPDATA%\watch-folder\watcher.err.log` (`RUST_LOG` controls verbosity, defaults to `info`).
+## Windows build notes
 
-Registering a Scheduled Task requires administrator rights; `sudo` is the Windows 11 built-in elevation helper. If `sudo` isn't enabled, run the same command from an Administrator PowerShell instead.
+The tray/GUI stack needs the MSVC linker. Install **Visual Studio Build Tools**
+with the "Desktop development with C++" workload, keep the default
+`stable-x86_64-pc-windows-msvc` toolchain, then `cargo build --release`.
 
-If the build fails with `linker link.exe not found`, no MSVC toolchain is installed — switch to the bundled MinGW toolchain, which needs no Visual Studio:
-
-```powershell
-rustup toolchain install stable-x86_64-pc-windows-gnu
-rustup default stable-x86_64-pc-windows-gnu
-cargo build --release
-```
+The GNU (`x86_64-pc-windows-gnu`) fallback currently can't link the GUI: rustc's
+raw-dylib import-library generation calls
+`dlltool --temp-prefix kernel32.dll:`, and the colon makes an invalid filename on
+Windows. CI cross-compiles the Windows binary from Linux (where this works), and
+the Linux build is unaffected.
 
 ## Releases
 
-Pushing a `v*` tag (e.g. `v0.1.0`) triggers `.github/workflows/release.yml`, which cross-compiles Linux and Windows binaries and attaches them to the GitHub release:
+Pushing a `v*` tag (e.g. `v0.2.0`) triggers `.github/workflows/release.yml`,
+which cross-compiles Linux and Windows binaries and attaches them to the GitHub
+release:
 
 ```
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```

@@ -1,6 +1,6 @@
 [package]
 name = "watch-folder"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -9,8 +9,19 @@ edition = "2021"
 notify = "6.1.1"
 env_logger = "0.10.0"
 log = "0.4.17"
-yaml-rust = "0.4.5"
 home = "0.5.5"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+eframe = "0.31"
+auto-launch = "0.6"
+opener = "0.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# StatusNotifierItem (D-Bus) backend avoids the GTK/libappindicator build deps.
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 daemonize-me = "2.0.1"
