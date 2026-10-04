@@ -22,11 +22,24 @@ tray; use **Quit** in the tray menu to actually exit.
 
 Tray menu:
 
+- **Status: Watching / Paused** — current state at the top of the menu
 - **Show / hide settings** — toggle the window
-- **Pause / resume** — stop/continue moving files
+- **Pause watching / Resume watching** — stop/continue moving files
 - **Reload config** — re-read the YAML from disk
-- **Open config file** / **Open logs**
+- **Open config file** — opens the YAML (or its folder if no editor is associated)
+- **Open logs** — opens `~/.config/watch-dir/watcher.log`
 - **Quit**
+
+Closing the window keeps the watcher running in the tray. To get the window
+back, click the tray icon and choose **Show / hide settings**.
+
+### Single instance
+
+Only one instance runs at a time. Launching the app again just shows the
+existing window. If the binary you launch is **newer** than the running one, it
+takes over: it asks the old instance to quit and then starts itself. (The very
+first upgrade away from v0.2.0 needs the old process ended manually, since that
+version had no instance listener.)
 
 ### Headless mode
 

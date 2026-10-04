@@ -1,6 +1,12 @@
 use std::collections::BTreeMap;
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 #[cfg(target_os = "linux")]
@@ -19,52 +25,28 @@ const ID_OPEN_CONFIG: &str = "watch-folder.open-config";
 const ID_OPEN_LOGS: &str = "watch-folder.open-logs";
 const ID_QUIT: &str = "watch-folder.quit";
 
-#[derive(Debug, Clone, Copy)]
-enum MenuAction {
-    ToggleWindow,
-    TogglePause,
-    Reload,
-    OpenConfig,
-    OpenLogs,
-    Quit,
-}
-
-fn action_for(id: &str) -> Option<MenuAction> {
-    match id {
-        ID_SHOW => Some(MenuAction::ToggleWindow),
-        ID_PAUSE => Some(MenuAction::TogglePause),
-        ID_RELOAD => Some(MenuAction::Reload),
-        ID_OPEN_CONFIG => Some(MenuAction::OpenConfig),
-        ID_OPEN_LOGS => Some(MenuAction::OpenLogs),
-        ID_QUIT => Some(MenuAction::Quit),
-        _ => None,
-    }
-}
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Loopback port used for single-instance detection and takeover.
+const INSTANCE_PORT: u16 = 49717;
 
 /// Start the tray application with its egui settings window.
 ///
 /// Returns an error if the tray icon or the windowing system is unavailable,
 /// so the caller can fall back to headless mode.
 pub fn run() -> Result<(), String> {
+    // Only one instance may run. A newer binary replaces an older running one;
+    // an equal/older binary just asks the running one to show its window.
+    let listener = match acquire_instance() {
+        InstanceOutcome::Primary(listener) => listener,
+        InstanceOutcome::AlreadyRunning => return Ok(()),
+    };
+
     let config = config::load_or_create();
-    let watcher = Watcher::start(config.clone());
+    let paused = Arc::new(AtomicBool::new(false));
+    let visible = Arc::new(AtomicBool::new(true));
+    let watcher = Watcher::start_with(config.clone(), paused.clone());
 
-    let (tx, rx) = channel::<MenuAction>();
-    let ctx_holder: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
-
-    // Forward tray menu clicks to the UI thread and wake it up.
-    {
-        let tx = tx;
-        let ctx_holder = ctx_holder.clone();
-        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if let Some(action) = action_for(&event.id.0) {
-                let _ = tx.send(action);
-            }
-            if let Some(ctx) = ctx_holder.lock().unwrap().as_ref() {
-                ctx.request_repaint();
-            }
-        }));
-    }
+    let (reload_tx, reload_rx) = channel::<()>();
 
     let (rgba, width, height) = icon_rgba(64);
     let viewport_icon = egui::IconData {
@@ -86,84 +68,296 @@ pub fn run() -> Result<(), String> {
         "watch-folder",
         native_options,
         Box::new(move |cc| {
-            *ctx_holder.lock().unwrap() = Some(cc.egui_ctx.clone());
             let tray = create_tray(rgba, width, height)?;
-            Ok(Box::new(App::new(config, watcher, rx, tray)))
+
+            // Listen for other launches (show window / takeover requests).
+            spawn_instance_listener(listener, cc.egui_ctx.clone(), visible.clone());
+
+            // Consume tray menu events on a dedicated thread and act on them
+            // immediately. This does not depend on egui's repaint loop, so it
+            // works even while the window is hidden.
+            {
+                let ctx = cc.egui_ctx.clone();
+                let paused = paused.clone();
+                let visible = visible.clone();
+                let reload_tx = reload_tx.clone();
+                thread::spawn(move || {
+                    let events = MenuEvent::receiver();
+                    while let Ok(event) = events.recv() {
+                        handle_menu_event(
+                            &event.id.0,
+                            &ctx,
+                            &paused,
+                            &visible,
+                            &reload_tx,
+                        );
+                    }
+                });
+            }
+
+            Ok(Box::new(App::new(
+                config,
+                watcher,
+                tray,
+                paused,
+                visible,
+                reload_rx,
+            )))
         }),
     )
     .map_err(|e| e.to_string())
+}
+
+fn handle_menu_event(
+    id: &str,
+    ctx: &egui::Context,
+    paused: &Arc<AtomicBool>,
+    visible: &Arc<AtomicBool>,
+    reload_tx: &Sender<()>,
+) {
+    log::info!("tray menu click: {id}");
+    match id {
+        ID_SHOW => {
+            let show = !visible.load(Ordering::SeqCst);
+            visible.store(show, Ordering::SeqCst);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
+            if show {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+        ID_PAUSE => {
+            let now_paused = !paused.load(Ordering::SeqCst);
+            paused.store(now_paused, Ordering::SeqCst);
+            log::info!("watcher {}", if now_paused { "paused" } else { "resumed" });
+        }
+        ID_RELOAD => {
+            let _ = reload_tx.send(());
+        }
+        ID_OPEN_CONFIG => open_path(&config::config_path()),
+        ID_OPEN_LOGS => open_path(&config::log_path()),
+        ID_QUIT => {
+            log::info!("quit requested from tray");
+            // Hard-exit so quitting works even if the window is hidden and no
+            // further frame is drawn. Submitted file moves are atomic renames,
+            // so there is no partial state to flush.
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+    ctx.request_repaint();
+}
+
+/// Open a file with its default application; if there is no association
+/// (common for `.yaml` on Windows), reveal the containing folder instead.
+fn open_path(path: &Path) {
+    log::info!("opening {path:?}");
+    if opener::open(path).is_err() {
+        log::warn!("no handler for {path:?}; opening its folder");
+        if let Some(parent) = path.parent() {
+            let _ = opener::open(parent);
+        }
+    }
+}
+
+enum InstanceOutcome {
+    Primary(TcpListener),
+    AlreadyRunning,
+}
+
+fn instance_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], INSTANCE_PORT))
+}
+
+fn bind_instance(tries: u32) -> Option<TcpListener> {
+    for _ in 0..tries {
+        if let Ok(listener) = TcpListener::bind(instance_addr()) {
+            return Some(listener);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+/// Try to become the primary instance. If another instance is already running,
+/// either take it over (when this binary is newer) or ask it to show its window.
+fn acquire_instance() -> InstanceOutcome {
+    if let Some(listener) = bind_instance(20) {
+        return InstanceOutcome::Primary(listener);
+    }
+
+    let running = running_version();
+    let newer = running
+        .as_deref()
+        .map(|v| version_gt(CURRENT_VERSION, v))
+        .unwrap_or(false);
+
+    if newer {
+        log::info!(
+            "replacing running instance v{} with v{CURRENT_VERSION}",
+            running.as_deref().unwrap_or("?")
+        );
+        send_instance_command("REPLACE");
+        if let Some(listener) = bind_instance(50) {
+            return InstanceOutcome::Primary(listener);
+        }
+        log::warn!("could not take over the instance port; exiting");
+        return InstanceOutcome::AlreadyRunning;
+    }
+
+    log::info!(
+        "another instance is already running (v{}); asking it to show",
+        running.as_deref().unwrap_or("?")
+    );
+    send_instance_command("SHOW");
+    InstanceOutcome::AlreadyRunning
+}
+
+fn connect_instance() -> Option<TcpStream> {
+    TcpStream::connect_timeout(&instance_addr(), Duration::from_millis(500)).ok()
+}
+
+fn send_instance_command(command: &str) {
+    if let Some(mut stream) = connect_instance() {
+        let _ = writeln!(stream, "{command}");
+    }
+}
+
+fn running_version() -> Option<String> {
+    let mut stream = connect_instance()?;
+    stream.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
+    writeln!(stream, "HELLO {CURRENT_VERSION}").ok()?;
+    let mut buf = [0u8; 128];
+    let n = stream.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    text.trim()
+        .strip_prefix("VERSION ")
+        .map(|v| v.trim().to_string())
+}
+
+fn spawn_instance_listener(listener: TcpListener, ctx: egui::Context, visible: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 128];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let text = String::from_utf8_lossy(&buf[..n]);
+            match text.trim() {
+                command if command.starts_with("HELLO") => {
+                    let _ = writeln!(stream, "VERSION {CURRENT_VERSION}");
+                }
+                "SHOW" => {
+                    visible.store(true, Ordering::SeqCst);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
+                }
+                "REPLACE" => {
+                    log::info!("a newer instance is taking over; exiting");
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn version_gt(a: &str, b: &str) -> bool {
+    let a = parse_version(a);
+    let b = parse_version(b);
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+fn parse_version(v: &str) -> Vec<u64> {
+    v.trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+struct TrayHandles {
+    tray: TrayIcon,
+    status_item: MenuItem,
+    pause_item: MenuItem,
 }
 
 fn create_tray(
     rgba: Vec<u8>,
     width: u32,
     height: u32,
-) -> Result<TrayIcon, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<TrayHandles, Box<dyn std::error::Error + Send + Sync>> {
     let menu = Menu::new();
-    menu.append(&MenuItem::with_id(
-        MenuId::new(ID_SHOW),
-        "Show / hide settings",
-        true,
-        None,
-    ))?;
+
+    let status_item =
+        MenuItem::with_id(MenuId::new("watch-folder.status"), "Status: Watching", false, None);
+    let show = MenuItem::with_id(MenuId::new(ID_SHOW), "Show / hide settings", true, None);
+    let pause_item = MenuItem::with_id(MenuId::new(ID_PAUSE), "Pause watching", true, None);
+    let reload = MenuItem::with_id(MenuId::new(ID_RELOAD), "Reload config", true, None);
+    let config_item = MenuItem::with_id(MenuId::new(ID_OPEN_CONFIG), "Open config file", true, None);
+    let logs = MenuItem::with_id(MenuId::new(ID_OPEN_LOGS), "Open logs", true, None);
+    let quit = MenuItem::with_id(MenuId::new(ID_QUIT), "Quit", true, None);
+
+    menu.append(&status_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&MenuItem::with_id(
-        MenuId::new(ID_PAUSE),
-        "Pause / resume",
-        true,
-        None,
-    ))?;
-    menu.append(&MenuItem::with_id(
-        MenuId::new(ID_RELOAD),
-        "Reload config",
-        true,
-        None,
-    ))?;
+    menu.append(&show)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&MenuItem::with_id(
-        MenuId::new(ID_OPEN_CONFIG),
-        "Open config file",
-        true,
-        None,
-    ))?;
-    menu.append(&MenuItem::with_id(
-        MenuId::new(ID_OPEN_LOGS),
-        "Open logs",
-        true,
-        None,
-    ))?;
+    menu.append(&pause_item)?;
+    menu.append(&reload)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&MenuItem::with_id(
-        MenuId::new(ID_QUIT),
-        "Quit",
-        true,
-        None,
-    ))?;
+    menu.append(&config_item)?;
+    menu.append(&logs)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&quit)?;
 
     let icon = tray_icon::Icon::from_rgba(rgba, width, height)?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("watch-folder")
+        .with_tooltip("watch-folder - watching")
         .with_icon(icon)
         .build()?;
-    Ok(tray)
+
+    Ok(TrayHandles {
+        tray,
+        status_item,
+        pause_item,
+    })
 }
 
 struct App {
     config: Config,
     draft: Draft,
     watcher: Watcher,
-    rx: Receiver<MenuAction>,
-    _tray: TrayIcon,
-    visible: bool,
-    quitting: bool,
+    reload_rx: Receiver<()>,
+    tray: TrayHandles,
+    paused: Arc<AtomicBool>,
+    visible: Arc<AtomicBool>,
     status: String,
+    last_tray_status: String,
     auto: Option<AutoLaunch>,
     autostart: bool,
 }
 
 impl App {
-    fn new(config: Config, watcher: Watcher, rx: Receiver<MenuAction>, tray: TrayIcon) -> App {
+    fn new(
+        config: Config,
+        watcher: Watcher,
+        tray: TrayHandles,
+        paused: Arc<AtomicBool>,
+        visible: Arc<AtomicBool>,
+        reload_rx: Receiver<()>,
+    ) -> App {
         let draft = Draft::from_config(&config);
         let auto = build_auto_launch();
         let autostart = auto
@@ -175,53 +369,58 @@ impl App {
             config,
             draft,
             watcher,
-            rx,
-            _tray: tray,
-            visible: true,
-            quitting: false,
+            reload_rx,
+            tray,
+            paused,
+            visible,
             status: "Watching".to_string(),
+            last_tray_status: String::new(),
             auto,
             autostart,
         }
     }
 
-    fn handle_action(&mut self, action: MenuAction, ctx: &egui::Context) {
-        match action {
-            MenuAction::ToggleWindow => self.set_visible(!self.visible, ctx),
-            MenuAction::TogglePause => self.toggle_pause(),
-            MenuAction::Reload => self.reload_from_disk(),
-            MenuAction::OpenConfig => {
-                if let Err(e) = opener::open(config::config_path()) {
-                    self.status = format!("Could not open config: {e}");
-                }
-            }
-            MenuAction::OpenLogs => {
-                if let Err(e) = opener::open(config::log_path()) {
-                    self.status = format!("Could not open logs: {e}");
-                }
-            }
-            MenuAction::Quit => {
-                self.quitting = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+    fn status_label(&self) -> &'static str {
+        if !self.watcher.is_running() {
+            "Stopped"
+        } else if self.paused.load(Ordering::SeqCst) {
+            "Paused"
+        } else {
+            "Watching"
         }
     }
 
-    fn set_visible(&mut self, visible: bool, ctx: &egui::Context) {
-        self.visible = visible;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
-        if visible {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    /// Keep the tray tooltip and the "Status:" menu item in sync.
+    fn sync_tray(&mut self) {
+        let label = self.status_label();
+        let status_text = format!("Status: {label}");
+        if status_text != self.last_tray_status {
+            self.tray.status_item.set_text(&status_text);
+            self.tray.pause_item.set_text(if self.paused.load(Ordering::SeqCst) {
+                "Resume watching"
+            } else {
+                "Pause watching"
+            });
+            let _ = self.tray.tray.set_tooltip(Some(format!("watch-folder - {label}")));
+            self.last_tray_status = status_text;
         }
     }
 
     fn toggle_pause(&mut self) {
-        if self.watcher.is_paused() {
-            self.watcher.resume();
-            self.status = "Watching".to_string();
+        let now_paused = !self.paused.load(Ordering::SeqCst);
+        self.paused.store(now_paused, Ordering::SeqCst);
+        self.status = if now_paused {
+            "Paused".to_string()
         } else {
-            self.watcher.pause();
-            self.status = "Paused".to_string();
+            "Watching".to_string()
+        };
+    }
+
+    fn set_visible(&mut self, visible: bool, ctx: &egui::Context) {
+        self.visible.store(visible, Ordering::SeqCst);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        if visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
@@ -274,26 +473,31 @@ impl App {
     }
 
     fn ui_status(&mut self, ui: &mut egui::Ui) {
-        ui.heading("watch-folder");
-        ui.add_space(2.0);
-        let (label, color) = if !self.watcher.is_running() {
-            ("Stopped", egui::Color32::RED)
-        } else if self.watcher.is_paused() {
-            ("Paused", egui::Color32::from_rgb(220, 160, 0))
-        } else {
-            ("Watching", egui::Color32::from_rgb(40, 160, 80))
+        ui.horizontal(|ui| {
+            ui.heading("watch-folder");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+            });
+        });
+        ui.add_space(4.0);
+        let (label, color) = match self.status_label() {
+            "Stopped" => ("Stopped", egui::Color32::from_rgb(220, 60, 60)),
+            "Paused" => ("Paused", egui::Color32::from_rgb(220, 160, 0)),
+            _ => ("Watching", egui::Color32::from_rgb(40, 160, 80)),
         };
         ui.horizontal(|ui| {
             ui.colored_label(color, format!("● {label}"));
-            if ui
-                .button(if self.watcher.is_paused() {
-                    "Resume"
-                } else {
-                    "Pause"
-                })
-                .clicked()
-            {
+            ui.add_space(8.0);
+            let btn = if self.paused.load(Ordering::SeqCst) {
+                "Resume"
+            } else {
+                "Pause"
+            };
+            if ui.button(btn).clicked() {
                 self.toggle_pause();
+            }
+            if ui.button("Reload config").clicked() {
+                self.reload_from_disk();
             }
         });
         ui.separator();
@@ -309,7 +513,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut w.path)
-                        .desired_width(340.0)
+                        .desired_width(360.0)
                         .hint_text("~/Downloads  |  C:\\Users\\me\\Downloads"),
                 );
                 if ui.button("Remove").clicked() {
@@ -322,7 +526,7 @@ impl App {
             if w.custom {
                 ui.indent(("watch-cats", i), |ui| category_editor(ui, &mut w.categories));
             }
-            ui.add_space(4.0);
+            ui.add_space(6.0);
         }
         if let Some(i) = remove {
             self.draft.watch.remove(i);
@@ -384,15 +588,19 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(action) = self.rx.try_recv() {
-            self.handle_action(action, ctx);
+        // "Reload config" is the one action that needs our own state; the rest
+        // are handled directly in the tray event handler.
+        if self.reload_rx.try_recv().is_ok() {
+            self.reload_from_disk();
         }
 
         // Closing the window hides it to the tray instead of quitting.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+        if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.set_visible(false, ctx);
         }
+
+        self.sync_tray();
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {

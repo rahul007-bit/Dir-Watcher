@@ -33,9 +33,10 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    pub fn start(config: Config) -> Watcher {
+    /// Start the watcher using a caller-provided pause flag, so other parts of
+    /// the app (e.g. the tray menu) can pause/resume it directly.
+    pub fn start_with(config: Config, paused: Arc<AtomicBool>) -> Watcher {
         let stop = Arc::new(AtomicBool::new(false));
-        let paused = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
 
         let rt = config.to_runtime();
@@ -64,30 +65,16 @@ impl Watcher {
         }
     }
 
-    pub fn pause(&self) {
-        self.paused.store(true, Ordering::SeqCst);
-    }
-
-    pub fn resume(&self) {
-        self.paused.store(false, Ordering::SeqCst);
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::SeqCst)
-    }
-
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// Replace the running watcher with one using `config`.
+    /// Replace the running watcher with one using `config`, keeping the same
+    /// (shared) pause flag.
     pub fn reload(&mut self, config: Config) {
-        let was_paused = self.is_paused();
+        let paused = self.paused.clone();
         self.shutdown();
-        *self = Watcher::start(config);
-        if was_paused {
-            self.pause();
-        }
+        *self = Watcher::start_with(config, paused);
     }
 
     fn shutdown(&mut self) {
