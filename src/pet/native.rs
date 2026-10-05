@@ -13,21 +13,21 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Graphics::GdiPlus::*;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
-    HDC,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, AC_SRC_ALPHA,
+    AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HDC,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetSystemMetrics,
-    PeekMessageW, RegisterClassExW, ShowWindow, TranslateMessage, UpdateLayeredWindow, MSG,
-    PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSEXW,
+    IsWindowVisible, PeekMessageW, RegisterClassExW, SetWindowPos, ShowWindow, TranslateMessage,
+    UpdateLayeredWindow, HWND_TOPMOST, MSG, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, ULW_ALPHA, WNDCLASSEXW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -421,8 +421,11 @@ struct Canvas {
 }
 
 impl Canvas {
-    unsafe fn new(screen_dc: HDC, w: i32, h: i32) -> Canvas {
-        let mem_dc = CreateCompatibleDC(screen_dc);
+    unsafe fn new(w: i32, h: i32) -> Canvas {
+        // `NULL` => memory DC compatible with the current screen. We avoid
+        // caching a screen DC: after a display/session change a cached DC can go
+        // stale and `UpdateLayeredWindow` silently stops updating the window.
+        let mem_dc = CreateCompatibleDC(std::ptr::null_mut());
         let mut bmi: BITMAPINFO = std::mem::zeroed();
         bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
         bmi.bmiHeader.biWidth = w;
@@ -446,10 +449,16 @@ impl Canvas {
     }
 
     unsafe fn clear(&self) {
+        if self.bits.is_null() {
+            return;
+        }
         std::ptr::write_bytes(self.bits, 0, (self.w * self.h * 4) as usize);
     }
 
-    unsafe fn present(&self, screen_dc: HDC, hwnd: HWND, x: i32, y: i32) {
+    unsafe fn present(&self, hwnd: HWND, x: i32, y: i32) {
+        if self.bits.is_null() || self.mem_dc.is_null() {
+            return;
+        }
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -464,7 +473,7 @@ impl Canvas {
         let src = POINT { x: 0, y: 0 };
         UpdateLayeredWindow(
             hwnd,
-            screen_dc,
+            std::ptr::null_mut(),
             &dst,
             &size,
             self.mem_dc,
@@ -763,13 +772,10 @@ fn run(
         };
         renderer.ensure_fonts();
 
-        let screen_dc = GetDC(null_mut());
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
-
         let mut canvas: Option<Canvas> = None;
         let mut shown = false;
         let mut running = true;
+        let mut last_topmost = Instant::now();
 
         while running && !stop.load(Ordering::SeqCst) {
             // Pump any pending window messages.
@@ -835,6 +841,10 @@ fn run(
                 .position_offset
                 .store(controller.position_offset.to_bits(), Ordering::Relaxed);
 
+            // Read the screen metrics fresh each frame so a resolution/DPI change
+            // is picked up instead of using stale values captured at startup.
+            let screen_w = GetSystemMetrics(SM_CXSCREEN);
+            let screen_h = GetSystemMetrics(SM_CYSCREEN);
             let (sx, sy, sw, sh) = compute_strip(
                 controller.folder_x,
                 controller.current_y,
@@ -849,7 +859,7 @@ fn run(
                 None => true,
             };
             if recreate {
-                canvas = Some(Canvas::new(screen_dc, sw, sh));
+                canvas = Some(Canvas::new(sw, sh));
             }
             let canvas = canvas.as_ref().unwrap();
             canvas.clear();
@@ -883,10 +893,32 @@ fn run(
                 GdipDisposeImage(gp_bitmap as *mut GpImage);
             }
 
-            canvas.present(screen_dc, hwnd, sx, sy);
+            canvas.present(hwnd, sx, sy);
             if !shown {
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 shown = true;
+                last_topmost = Instant::now();
+            }
+
+            // Re-assert topmost periodically. Virtual-desktop switches and other
+            // topmost windows can push the pet behind normal windows; keeping it
+            // at the top of the topmost band makes it reliably "always on top".
+            if last_topmost.elapsed() >= Duration::from_millis(1000) {
+                last_topmost = Instant::now();
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                // The OS can hide a layered tool window on session or
+                // virtual-desktop changes; bring it back if it went away.
+                if IsWindowVisible(hwnd) == 0 {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
             }
 
             let sleep = delay
@@ -899,7 +931,6 @@ fn run(
             ShowWindow(hwnd, SW_HIDE);
         }
         drop(canvas);
-        ReleaseDC(null_mut(), screen_dc);
         drop(renderer);
         DestroyWindow(hwnd);
         log::info!("native pet thread exited");
