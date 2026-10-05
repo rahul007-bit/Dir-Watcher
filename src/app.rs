@@ -1027,15 +1027,9 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
     fn pet_is_dragging(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.pet_shared().map(|s| s.dragging()).unwrap_or(false)
-        }
-        #[cfg(not(windows))]
-        {
-            self.pet.is_dragging_desk
-        }
+        self.pet_shared().map(|s| s.dragging()).unwrap_or(false)
     }
 
     fn pet_paper_count(&self) -> usize {
@@ -1082,17 +1076,11 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
     fn pet_position_offset(&self) -> f32 {
-        #[cfg(windows)]
-        {
-            self.pet_shared()
-                .map(|s| s.position_offset())
-                .unwrap_or(0.0)
-        }
-        #[cfg(not(windows))]
-        {
-            self.pet.position_offset
-        }
+        self.pet_shared()
+            .map(|s| s.position_offset())
+            .unwrap_or(0.0)
     }
 
     fn pet_set_position_offset(&mut self, value: f32) {
