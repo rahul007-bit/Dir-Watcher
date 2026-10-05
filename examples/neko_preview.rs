@@ -150,6 +150,10 @@ impl eframe::App for NekoPreviewApp {
                     if ui.selectable_label(is_slime, "White Mochi (Slime)").clicked() {
                         self.pet.set_character(CharacterKind::Slime);
                     }
+                    let is_hamster = self.pet.spec.kind == CharacterKind::Hamster;
+                    if ui.selectable_label(is_hamster, "Chubby Hamster").clicked() {
+                        self.pet.set_character(CharacterKind::Hamster);
+                    }
                 });
             });
 
@@ -222,6 +226,11 @@ impl eframe::App for NekoPreviewApp {
                 if ui.button("Drop / Claw Swat").clicked() {
                     self.mouse_chaser_mode = false;
                     self.forced_state = Some(PetState::Arranging);
+                    self.pet.player.reset();
+                }
+                if ui.button("Groom").clicked() {
+                    self.mouse_chaser_mode = false;
+                    self.forced_state = Some(PetState::Grooming);
                     self.pet.player.reset();
                 }
                 if ui.button("Sleep (Curled Loaf)").clicked() {

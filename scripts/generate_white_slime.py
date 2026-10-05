@@ -1,13 +1,14 @@
 from PIL import Image, ImageDraw
 
-# Create 320x160 RGBA spritesheet (10 columns x 5 rows of 32x32 frames)
+# Create 320x192 RGBA spritesheet (10 columns x 6 rows of 32x32 frames)
 # Row 0: Idle (10 frames) - cute blinking & soft wobble
 # Row 1: Alert (10 frames) - eyes pop open, surprise hop with '!'
 # Row 2: Walk / Hop (10 frames) - squash & stretch bouncing forward
 # Row 3: Drop / Toss (10 frames) - happy bow & file toss
 # Row 4: Sleep (10 frames) - plump round mochi loaf breathing gently (NOT a dead puddle!)
+# Row 5: Groom (10 frames) - shiny self-polish wiggle with sparkles
 
-sheet = Image.new('RGBA', (320, 160), (0, 0, 0, 0))
+sheet = Image.new('RGBA', (320, 192), (0, 0, 0, 0))
 
 # Palette: Clean White Mochi
 OUTLINE = (70, 80, 95, 255)       # Crisp border so visible on light & dark desktop
@@ -141,8 +142,26 @@ sleep_breaths = [
 for c, (oy, w, h) in enumerate(sleep_breaths):
     draw_slime(c, 4, oy=oy, w=w, h=h, eyes='sleep', eye_y=1, blush=True)
 
+# --- Row 5: Groom (shiny self-polish wiggle & sparkles) ---
+for c in range(10):
+    if c in (0, 1, 8, 9):
+        draw_slime(c, 5, w=20, h=14, eyes='open')
+    elif c in (2, 3, 6, 7):
+        # Wiggling as it polishes itself
+        draw_slime(c, 5, w=18, h=15, eyes='happy')
+    else:
+        draw_slime(c, 5, w=21, h=13, eyes='happy')
+    # Sparkle glints while grooming
+    if c in (1, 2, 4, 5, 7, 8):
+        d = ImageDraw.Draw(sheet)
+        sx = c * 32 + (10 if c % 2 == 0 else 21)
+        sy = 5 * 32 + (7 if c % 2 == 0 else 11)
+        d.line([(sx - 1, sy), (sx + 1, sy)], fill=(255, 255, 255, 255))
+        d.line([(sx, sy - 1), (sx, sy + 1)], fill=(255, 255, 255, 255))
+        d.point([(sx, sy)], fill=(200, 235, 255, 255))
+
 sheet.save('assets/pet/slime_white_mochi.png')
-print("Successfully generated assets/pet/slime_white_mochi.png (320x160 RGBA)")
+print("Successfully generated assets/pet/slime_white_mochi.png (320x192 RGBA)")
 
 # Updated cute soft-blue Zzz strip
 zzz_sheet = Image.new('RGBA', (128, 32), (0, 0, 0, 0))

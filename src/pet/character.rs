@@ -10,16 +10,24 @@ pub enum CharacterKind {
     Slime,
     Neko,
     Oneko,
-    Dog,
+    Hamster,
 }
 
 impl CharacterKind {
+    /// Every selectable companion, in menu order.
+    pub const ALL: [CharacterKind; 4] = [
+        CharacterKind::Slime,
+        CharacterKind::Neko,
+        CharacterKind::Oneko,
+        CharacterKind::Hamster,
+    ];
+
     pub fn display_name(&self) -> &'static str {
         match self {
             CharacterKind::Slime => "White Mochi Slime",
             CharacterKind::Neko => "Pixel Neko (Calico)",
             CharacterKind::Oneko => "Classic Oneko (1989)",
-            CharacterKind::Dog => "Shiba Inu",
+            CharacterKind::Hamster => "Chubby Hamster",
         }
     }
 }
@@ -52,12 +60,15 @@ pub struct CharacterSpec {
     pub anim_sleep: AnimationDef,
     pub anim_alert: AnimationDef,
     pub anim_drop: AnimationDef,
+    /// Optional grooming animation. Falls back to the idle row when absent.
+    pub anim_groom: Option<AnimationDef>,
 }
 
 // Embedded assets
 pub const SLIME_SHEET: &[u8] = include_bytes!("../../assets/pet/slime_white_mochi.png");
 pub const NEKO_SHEET: &[u8] = include_bytes!("../../assets/pet/neko.png");
 pub const ONEKO_SHEET: &[u8] = include_bytes!("../../assets/pet/oneko.png");
+pub const HAMSTER_SHEET: &[u8] = include_bytes!("../../assets/pet/hamster.png");
 pub const FILE_ICON: &[u8] = include_bytes!("../../assets/pet/paper_realistic.png");
 pub const ZZZ_SHEET: &[u8] = include_bytes!("../../assets/pet/zzz_particles.png");
 pub const FOLDER_SLOT: &[u8] = include_bytes!("../../assets/pet/folder_slot.png");
@@ -68,8 +79,13 @@ impl CharacterSpec {
             CharacterKind::Slime => Self::slime(),
             CharacterKind::Neko => Self::neko(),
             CharacterKind::Oneko => Self::oneko(),
-            CharacterKind::Dog => Self::dog_placeholder(),
+            CharacterKind::Hamster => Self::hamster(),
         }
+    }
+
+    /// Animation for the grooming idle state (falls back to idle).
+    pub fn groom(&self) -> &AnimationDef {
+        self.anim_groom.as_ref().unwrap_or(&self.anim_idle)
     }
 
     /// White Mochi Slime layout (32x32 frames, 10 frames per row):
@@ -120,6 +136,13 @@ impl CharacterSpec {
                 frame_ms: 220,
                 loops: true,
             },
+            anim_groom: Some(AnimationDef {
+                row: 5,
+                start_col: 0,
+                frame_count: 10,
+                frame_ms: 150,
+                loops: true,
+            }),
         }
     }
 
@@ -171,6 +194,7 @@ impl CharacterSpec {
                 frame_ms: 220,
                 loops: true,
             },
+            anim_groom: None,
         }
     }
 
@@ -222,13 +246,66 @@ impl CharacterSpec {
                 frame_ms: 250,
                 loops: true,
             },
+            anim_groom: None,
         }
     }
 
-    /// Dog placeholder fallback
-    fn dog_placeholder() -> Self {
-        let mut spec = Self::slime();
-        spec.kind = CharacterKind::Dog;
-        spec
+    /// Chubby Hamster layout (32x32 frames) generated from AI animation frames:
+    /// Row 0: Idle (4 frames) - gentle sit, breathing and blinks
+    /// Row 1: Alert (6 frames) - startle hop with '!'
+    /// Row 2: Walk (4 frames) - bouncy forward hop
+    /// Row 3: Drop (4 frames) - nose down to the paper
+    /// Row 4: Sleep (6 frames) - cozy flattened loaf, eyes closed
+    /// Row 5: Groom (6 frames) - washes its face with a paw
+    fn hamster() -> Self {
+        Self {
+            kind: CharacterKind::Hamster,
+            frame_width: 32,
+            frame_height: 32,
+            sheet_bytes: HAMSTER_SHEET,
+            carry_offset: (0.0, -16.0),
+            anim_idle: AnimationDef {
+                row: 0,
+                start_col: 0,
+                frame_count: 4,
+                frame_ms: 200,
+                loops: true,
+            },
+            anim_alert: AnimationDef {
+                row: 1,
+                start_col: 0,
+                frame_count: 6,
+                frame_ms: 90,
+                loops: false,
+            },
+            anim_walk: AnimationDef {
+                row: 2,
+                start_col: 0,
+                frame_count: 4,
+                frame_ms: 110,
+                loops: true,
+            },
+            anim_drop: AnimationDef {
+                row: 3,
+                start_col: 0,
+                frame_count: 4,
+                frame_ms: 110,
+                loops: false,
+            },
+            anim_sleep: AnimationDef {
+                row: 4,
+                start_col: 0,
+                frame_count: 6,
+                frame_ms: 260,
+                loops: true,
+            },
+            anim_groom: Some(AnimationDef {
+                row: 5,
+                start_col: 0,
+                frame_count: 6,
+                frame_ms: 160,
+                loops: true,
+            }),
+        }
     }
 }

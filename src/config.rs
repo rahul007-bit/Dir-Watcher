@@ -22,6 +22,8 @@ pub struct Config {
     pub pet_enabled: bool,
     #[serde(rename = "pet-position-offset", default = "default_pet_position_offset")]
     pub pet_position_offset: f32,
+    #[serde(rename = "pet-character", default = "default_pet_character")]
+    pub pet_character: crate::pet::character::CharacterKind,
 }
 
 fn default_pet_enabled() -> bool {
@@ -30,6 +32,10 @@ fn default_pet_enabled() -> bool {
 
 fn default_pet_position_offset() -> f32 {
     0.0
+}
+
+fn default_pet_character() -> crate::pet::character::CharacterKind {
+    crate::pet::character::CharacterKind::default()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -126,6 +132,7 @@ impl Default for Config {
             stability: Stability::default(),
             pet_enabled: true,
             pet_position_offset: 0.0,
+            pet_character: crate::pet::character::CharacterKind::default(),
         }
     }
 }

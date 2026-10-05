@@ -10,29 +10,51 @@ Use this guide to generate new pet characters (e.g. Cats, Shiba Inus, Bunnies, o
 
 Every pet companion is driven by a single unified spritesheet formatted as follows:
 
-- **Total Dimensions**: `320 x 160 px` (RGBA 32-bit PNG)
-- **Grid Layout**: `10 columns x 5 rows`
+- **Total Dimensions**: `320 x 192 px` (RGBA 32-bit PNG)
+- **Grid Layout**: `10 columns x 6 rows`
 - **Frame Size**: `32 x 32 px` per frame
 - **Origin / Anchor**: Bottom-aligned at `y = 30` within each 32px frame, ensuring feet or base resting squarely on the taskbar top edge.
 
 ```
        Col 0   Col 1   Col 2   Col 3   Col 4   Col 5   Col 6   Col 7   Col 8   Col 9
-Row 0: [------------------------- Idle (10 frames) ---------------------------]
-Row 1: [------------------------- Alert (10 frames) --------------------------]
-Row 2: [------------------------- Walk / Hop (10 frames) ---------------------]
-Row 3: [------------------------- Drop / Toss (10 frames) --------------------]
-Row 4: [------------------------- Sleep (10 frames) --------------------------]
+Row 0: [------------------------- Idle (up to 10 frames) ---------------------]
+Row 1: [------------------------- Alert (up to 10 frames) --------------------]
+Row 2: [------------------------- Walk / Hop (up to 10 frames) ---------------]
+Row 3: [------------------------- Drop / Toss (up to 10 frames) --------------]
+Row 4: [------------------------- Sleep (up to 10 frames) --------------------]
+Row 5: [------------------------- Groom (up to 10 frames) --------------------]
 ```
+
+> Rows may use fewer than 10 frames; `AnimationDef::frame_count` controls playback
+> (e.g. the AI-generated hamster uses 4–6 frames per row). Unused cells stay empty.
 
 ### Animation Row Breakdown
 
 | Row | State | Frames | Timing (FPS) | Purpose & Movement Details |
 |---|---|---|---|---|
-| **0** | **Idle** | 10 | 6 FPS | Gentle resting wobble, soft breathing rhythm, occasional eye blink on frames 3–4. |
-| **1** | **Alert** | 10 | 8 FPS | Surprise hop when a new file lands: eyes pop wide, hops upward by 4px, lands upright. |
-| **2** | **Walk / Hop** | 10 | 10 FPS | Forward locomotion: squash on takeoff, airborne stretch, and squash on landing. |
-| **3** | **Drop / Toss**| 10 | 8 FPS | Delivery bow: arcs carried files neatly into the folder slot. |
-| **4** | **Sleep** | 10 | 4 FPS | Peaceful loaf: eyes gently shut (`- -`), breathing expansion (+1px width cycle). Must look like a sleeping loaf, never a flat puddle. |
+| **0** | **Idle** | ≤10 | 6 FPS | Gentle resting wobble, soft breathing rhythm, occasional eye blink. |
+| **1** | **Alert** | ≤10 | 8 FPS | Surprise hop when a new file lands: eyes pop wide, hops upward, lands upright. |
+| **2** | **Walk / Hop** | ≤10 | 10 FPS | Forward locomotion: squash on takeoff, airborne stretch, and squash on landing. |
+| **3** | **Drop / Toss**| ≤10 | 8 FPS | Delivery bow: arcs carried files neatly into the folder slot. |
+| **4** | **Sleep** | ≤10 | 4 FPS | Peaceful loaf: eyes gently shut, breathing expansion. Never a flat puddle. |
+| **5** | **Groom** | ≤10 | 7 FPS | Idle variant: washes its face / polishes itself. Alternates with Sleep while at home. |
+
+### Bringing AI-generated art into the engine
+
+Pets can be authored by an image model (e.g. Gemini "nano banana") instead of
+drawn by hand. Ask for a **single grid**: 6 rows × N columns, one row per action
+in the order above, on a **flat solid magenta `#FF00FF`** background, matching a
+reference sprite's style. Then pack it:
+
+```
+python scripts/pack_generated.py --pet hamster \
+    --grid assets/pet/src/gen/hamster/sheet.png --grid-rows 6 --grid-cols 4
+```
+
+The packer removes the background (including the magenta fringe), slices each
+frame, applies a shared scale per row, aligns feet to `y = 30`, and writes
+`assets/pet/<pet>.png`. Per-action strips named `idle/alert/walk/drop/sleep/groom`
+under `--strips DIR` work too.
 
 ---
 

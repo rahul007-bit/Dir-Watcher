@@ -779,6 +779,7 @@ struct App {
     #[cfg(not(windows))]
     pet: crate::pet::PetController,
     pet_tx: Sender<crate::pet::PetEvent>,
+    pet_kind: crate::pet::character::CharacterKind,
     stage: Stage,
     own_version: &'static str,
     current_version: Option<String>,
@@ -816,18 +817,23 @@ impl App {
             }
         }
 
+        let kind = config.pet_character;
+
         #[cfg(windows)]
-        let native_pet =
-            crate::pet::native::NativePet::spawn(config.pet_enabled, 28.0, config.pet_position_offset, pet_rx);
-        #[cfg(windows)]
-        let pet_spec = crate::pet::character::CharacterSpec::for_kind(
-            crate::pet::character::CharacterKind::Slime,
+        let native_pet = crate::pet::native::NativePet::spawn(
+            config.pet_enabled,
+            28.0,
+            config.pet_position_offset,
+            kind,
+            pet_rx,
         );
+        #[cfg(windows)]
+        let pet_spec = crate::pet::character::CharacterSpec::for_kind(kind);
         // TODO(linux/macos): replace this egui-viewport fallback with a native
         // per-pixel-alpha overlay (see the TODOs in `src/pet/mod.rs`) so
         // transparency and idle CPU match the Windows `pet::native` backend.
         #[cfg(not(windows))]
-        let mut pet = crate::pet::PetController::new(Some(pet_rx));
+        let mut pet = crate::pet::PetController::new_with_kind(Some(pet_rx), kind);
         #[cfg(not(windows))]
         {
             pet.enabled = config.pet_enabled;
@@ -857,6 +863,7 @@ impl App {
             #[cfg(not(windows))]
             pet,
             pet_tx,
+            pet_kind: kind,
             stage: if need_prompt {
                 Stage::Prompt
             } else {
@@ -1065,6 +1072,22 @@ impl App {
         }
     }
 
+    fn pet_set_character(&mut self, kind: crate::pet::character::CharacterKind) {
+        self.pet_kind = kind;
+        #[cfg(windows)]
+        {
+            if let Some(pet) = &self.native_pet {
+                pet.set_character(kind);
+            }
+            self.pet_spec = crate::pet::character::CharacterSpec::for_kind(kind);
+            self.pet_preview = None; // reload preview textures with the new sheet
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.set_character(kind);
+        }
+    }
+
     fn pet_set_speed(&mut self, value: f32) {
         #[cfg(windows)]
         if let Some(shared) = self.pet_shared() {
@@ -1132,6 +1155,7 @@ impl App {
         let spec = self.pet_spec();
         match self.pet_state() {
             crate::pet::PetState::Sleeping => spec.anim_sleep,
+            crate::pet::PetState::Grooming => *spec.groom(),
             crate::pet::PetState::Alert => spec.anim_alert,
             crate::pet::PetState::Collecting
             | crate::pet::PetState::WalkingToTray
@@ -1178,6 +1202,7 @@ impl App {
         self.draft = Draft::from_config(&config);
         self.pet_set_enabled(config.pet_enabled);
         self.pet_set_position_offset(config.pet_position_offset);
+        self.pet_set_character(config.pet_character);
         self.config = config;
         self.status = "Reloaded config from disk".to_string();
     }
@@ -1189,6 +1214,7 @@ impl App {
                 self.watcher.reload(config.clone());
                 self.pet_set_enabled(config.pet_enabled);
                 self.pet_set_position_offset(config.pet_position_offset);
+                self.pet_set_character(config.pet_character);
                 self.config = config;
                 self.status = "Saved and restarted watcher".to_string();
             }
@@ -1376,8 +1402,28 @@ impl App {
 
         if self.pet_enabled() {
             ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Companion:");
+                let mut selected = self.pet_kind;
+                egui::ComboBox::from_id_salt("pet_character_picker")
+                    .selected_text(selected.display_name())
+                    .show_ui(ui, |ui| {
+                        for kind in crate::pet::character::CharacterKind::ALL {
+                            ui.selectable_value(&mut selected, kind, kind.display_name());
+                        }
+                    });
+                if selected != self.pet_kind {
+                    self.pet_set_character(selected);
+                    self.draft.pet_character = selected;
+                    ui.ctx().request_repaint();
+                }
+            });
+            ui.add_space(4.0);
+
             let (state_str, state_color) = match self.pet_state() {
                 crate::pet::PetState::Sleeping => ("Sleeping near folder zZz", egui::Color32::from_rgb(150, 180, 220)),
+                crate::pet::PetState::Grooming => ("Grooming its fur...", egui::Color32::from_rgb(200, 170, 230)),
                 crate::pet::PetState::Alert => ("Alert! Noticed new file!", egui::Color32::from_rgb(255, 205, 50)),
                 crate::pet::PetState::Collecting => ("Collecting fluttering papers...", egui::Color32::from_rgb(100, 210, 140)),
                 crate::pet::PetState::WalkingToTray => ("Carrying papers to folder...", egui::Color32::from_rgb(100, 210, 140)),
@@ -1587,6 +1633,7 @@ impl eframe::App for App {
                             self.draft = Draft::from_config(&self.config);
                             self.pet_set_enabled(self.config.pet_enabled);
                             self.pet_set_position_offset(self.config.pet_position_offset);
+                            self.pet_set_character(self.config.pet_character);
                             self.status = "Reverted unsaved changes".to_string();
                         }
                         let dirty = self.is_dirty();
@@ -1681,6 +1728,7 @@ struct Draft {
     required_ticks: u32,
     pet_enabled: bool,
     pet_position_offset: f32,
+    pet_character: crate::pet::character::CharacterKind,
 }
 
 impl Draft {
@@ -1706,6 +1754,7 @@ impl Draft {
             required_ticks: config.stability.required_stable_ticks,
             pet_enabled: config.pet_enabled,
             pet_position_offset: config.pet_position_offset,
+            pet_character: config.pet_character,
         }
     }
 
@@ -1732,6 +1781,7 @@ impl Draft {
             },
             pet_enabled: self.pet_enabled,
             pet_position_offset: self.pet_position_offset,
+            pet_character: self.pet_character,
         }
     }
 }

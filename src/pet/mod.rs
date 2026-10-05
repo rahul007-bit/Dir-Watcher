@@ -41,6 +41,7 @@ use taskbar::{get_taskbar_info, TaskbarInfo};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PetState {
     Sleeping,
+    Grooming,
     Alert,
     Collecting,
     WalkingToTray,
@@ -110,6 +111,8 @@ pub struct PetController {
     // Animation & status timers
     pub alert_timer: f32,
     pub arrange_timer: f32,
+    /// Countdown for alternating between Sleeping and Grooming while at home.
+    pub idle_timer: f32,
     pub folder_alpha: f32, // Folder stationed at home base
     pub entrance_t: f32,   // 0.0 to 1.0 (smooth rise from taskbar at startup)
     pub is_overwhelmed: bool,
@@ -167,6 +170,7 @@ impl PetController {
             random_seed: 54321,
             alert_timer: 0.0,
             arrange_timer: 0.0,
+            idle_timer: 22.0,
             folder_alpha: 1.0,
             entrance_t: 1.0, // Instantly ready, no weird offset
             is_overwhelmed: false,
@@ -280,7 +284,7 @@ impl PetController {
             // The slime body baseline in 32px frame is at y = 30.
             // Setting current_y = tb_top - 30.0 aligns the slime's feet exactly on the top edge of the taskbar!
             self.current_y = tb_top - 30.0;
-            if self.state == PetState::Sleeping {
+            if matches!(self.state, PetState::Sleeping | PetState::Grooming) {
                 self.current_x = self.home_x;
             }
         }
@@ -298,7 +302,7 @@ impl PetController {
     pub fn spawn_paper_at(&mut self, name: String, drop_x: f32) {
         let start_y = self.current_y - 85.0; // High in the air
         let target_y = self.current_y + 14.0; // Exactly on taskbar baseline (matches 16px paper height)
-        let flutter_t = self.pseudo_random(0.0, 6.28);
+        let flutter_t = self.pseudo_random(0.0, std::f32::consts::TAU);
         let flutter_speed = self.pseudo_random(4.5, 6.5);
         let sway_amp = self.pseudo_random(10.0, 16.0);
 
@@ -314,8 +318,8 @@ impl PetController {
             landed: false,
         });
 
-        // If sleeping and papers appear, wake up!
-        if self.state == PetState::Sleeping {
+        // If sleeping (or grooming) and papers appear, wake up!
+        if matches!(self.state, PetState::Sleeping | PetState::Grooming) {
             self.state = PetState::Alert;
             self.alert_timer = 0.5;
             self.player.reset();
@@ -388,8 +392,8 @@ impl PetController {
         let lbutton_clicked = lbutton_down && !self.was_lbutton_down;
         self.was_lbutton_down = lbutton_down;
 
-        // --- Drag & drop Mochi and folder desk together when Mochi is sleeping ---
-        if self.state == PetState::Sleeping {
+        // --- Drag & drop Mochi and folder desk together when Mochi is idle ---
+        if matches!(self.state, PetState::Sleeping | PetState::Grooming) {
             if let Some((phys_x, phys_y)) = taskbar::get_global_cursor_pos() {
                 let ppp = self.ppp.max(0.5);
                 let cursor_x = phys_x / ppp;
@@ -515,10 +519,32 @@ impl PetController {
         match self.state {
             PetState::Sleeping => {
                 let delay = self.player.update(&self.spec.anim_sleep);
+                self.idle_timer -= dt;
+                if !self.is_dragging_desk && self.idle_timer <= 0.0 {
+                    // Wake up just enough to groom for a moment.
+                    self.state = PetState::Grooming;
+                    self.idle_timer = self.pseudo_random(4.0, 8.0);
+                    self.player.reset();
+                }
                 if self.is_dragging_desk {
                     Duration::from_millis(16)
                 } else {
                     delay.max(Duration::from_millis(250))
+                }
+            }
+            PetState::Grooming => {
+                let anim = *self.spec.groom();
+                let delay = self.player.update(&anim);
+                self.idle_timer -= dt;
+                if !self.is_dragging_desk && self.idle_timer <= 0.0 {
+                    self.state = PetState::Sleeping;
+                    self.idle_timer = self.pseudo_random(16.0, 36.0);
+                    self.player.reset();
+                }
+                if self.is_dragging_desk {
+                    Duration::from_millis(16)
+                } else {
+                    delay.max(Duration::from_millis(200))
                 }
             }
             PetState::Alert => {
@@ -645,6 +671,7 @@ impl PetController {
                     self.current_x = target_x;
                     self.facing_left = false;
                     self.state = PetState::Sleeping;
+                    self.idle_timer = self.pseudo_random(16.0, 36.0);
                     self.player.reset();
                 } else if self.current_x > target_x {
                     self.current_x -= step;
@@ -739,6 +766,7 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
 
         let anim_def = match self.state {
             PetState::Sleeping => &self.spec.anim_sleep,
+            PetState::Grooming => self.spec.groom(),
             PetState::Alert => &self.spec.anim_alert,
             PetState::Collecting => &self.spec.anim_walk,
             PetState::WalkingToTray => &self.spec.anim_walk,

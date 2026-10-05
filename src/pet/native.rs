@@ -54,6 +54,7 @@ fn state_to_u8(state: PetState) -> u8 {
         PetState::Arranging => 4,
         PetState::WalkingHome => 5,
         PetState::Stuck => 6,
+        PetState::Grooming => 7,
     }
 }
 
@@ -65,6 +66,7 @@ fn u8_to_state(value: u8) -> PetState {
         4 => PetState::Arranging,
         5 => PetState::WalkingHome,
         6 => PetState::Stuck,
+        7 => PetState::Grooming,
         _ => PetState::Sleeping,
     }
 }
@@ -74,6 +76,7 @@ pub enum PetCommand {
     HelpClean,
     SayHi(String),
     Realign,
+    SetCharacter(CharacterKind),
     Shutdown,
 }
 
@@ -165,6 +168,7 @@ impl NativePet {
         enabled: bool,
         speed: f32,
         position_offset: f32,
+        kind: CharacterKind,
         rx: Receiver<PetEvent>,
     ) -> NativePet {
         let shared = Arc::new(SharedPet::new(enabled, speed, position_offset));
@@ -182,6 +186,7 @@ impl NativePet {
                 enabled,
                 speed,
                 position_offset,
+                kind,
                 rx,
             );
         });
@@ -206,6 +211,9 @@ impl NativePet {
     }
     pub fn realign(&self) {
         let _ = self.cmd_tx.send(PetCommand::Realign);
+    }
+    pub fn set_character(&self, kind: CharacterKind) {
+        let _ = self.cmd_tx.send(PetCommand::SetCharacter(kind));
     }
 }
 
@@ -348,6 +356,17 @@ impl Renderer {
             spec,
             fonts: None,
         })
+    }
+
+    unsafe fn set_character(&mut self, spec: CharacterSpec) -> bool {
+        match GdiImage::from_png(spec.sheet_bytes) {
+            Some(image) => {
+                self.character = image;
+                self.spec = spec;
+                true
+            }
+            None => false,
+        }
     }
 
     unsafe fn ensure_fonts(&mut self) {
@@ -715,6 +734,7 @@ fn run(
     enabled: bool,
     speed: f32,
     position_offset: f32,
+    kind: CharacterKind,
     rx: Receiver<PetEvent>,
 ) {
     unsafe {
@@ -758,14 +778,14 @@ fn run(
         }
 
         let mut controller = PetController::new(Some(rx));
-        controller.set_character(CharacterKind::Slime);
+        controller.set_character(kind);
         controller.enabled = enabled;
         controller.speed = speed;
         controller.position_offset = position_offset;
         controller.ppp = 1.0;
         controller.refresh_taskbar_coords();
 
-        let Some(mut renderer) = Renderer::new(CharacterSpec::for_kind(CharacterKind::Slime)) else {
+        let Some(mut renderer) = Renderer::new(CharacterSpec::for_kind(kind)) else {
             log::error!("native pet: GDI+ init failed");
             DestroyWindow(hwnd);
             return;
@@ -791,6 +811,11 @@ fn run(
                     PetCommand::HelpClean => controller.help_clean(),
                     PetCommand::SayHi(text) => controller.say_funny(&text, 3.0),
                     PetCommand::Realign => controller.refresh_taskbar_coords(),
+                    PetCommand::SetCharacter(kind) => {
+                        if renderer.set_character(CharacterSpec::for_kind(kind)) {
+                            controller.set_character(kind);
+                        }
+                    }
                     PetCommand::Shutdown => running = false,
                 }
             }
@@ -957,6 +982,7 @@ unsafe fn draw_pet(
 
     let anim_def = match pet.state {
         PetState::Sleeping => &spec.anim_sleep,
+        PetState::Grooming => spec.groom(),
         PetState::Alert => &spec.anim_alert,
         PetState::Collecting => &spec.anim_walk,
         PetState::WalkingToTray => &spec.anim_walk,
