@@ -24,6 +24,27 @@ pub struct Config {
     pub pet_position_offset: f32,
     #[serde(rename = "pet-character", default = "default_pet_character")]
     pub pet_character: crate::pet::character::CharacterKind,
+    #[serde(rename = "icon-style", default)]
+    pub icon_style: IconStyle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IconStyle {
+    #[default]
+    Calico,
+    Monochrome,
+}
+
+impl IconStyle {
+    pub const ALL: [IconStyle; 2] = [IconStyle::Calico, IconStyle::Monochrome];
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            IconStyle::Calico => "Calico Neko (Retro Color)",
+            IconStyle::Monochrome => "Retro Monochrome (B&W)",
+        }
+    }
 }
 
 fn default_pet_enabled() -> bool {
@@ -133,6 +154,7 @@ impl Default for Config {
             pet_enabled: true,
             pet_position_offset: 0.0,
             pet_character: crate::pet::character::CharacterKind::default(),
+            icon_style: IconStyle::default(),
         }
     }
 }

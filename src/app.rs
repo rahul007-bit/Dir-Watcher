@@ -170,12 +170,18 @@ pub fn run() -> Result<(), String> {
             None => true,
         };
 
-    let (rgba, width, height) = icon_rgba(64);
+    // 256 px gives the OS plenty of pixels to scale the title-bar / taskbar icon
+    // cleanly on every DPI setting (100 % – 200 % and beyond).
+    let (rgba_window, ww, wh) = icon_rgba(config.icon_style, 256);
     let viewport_icon = egui::IconData {
-        rgba: rgba.clone(),
-        width,
-        height,
+        rgba: rgba_window,
+        width: ww,
+        height: wh,
     };
+
+    // 128 px for the tray: high enough for 200 % DPI (32-px slot × 4× factor)
+    // while still keeping the buffer small enough for the tray-icon crate.
+    let (rgba_tray, tw, th) = icon_rgba(config.icon_style, 128);
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -193,7 +199,7 @@ pub fn run() -> Result<(), String> {
         Box::new(move |cc| {
             configure_style(&cc.egui_ctx);
             let hwnd = window_handle_isize(cc);
-            let tray = create_tray(rgba, width, height)?;
+            let tray = create_tray(rgba_tray, tw, th)?;
 
             // Listen for other launches (show window / takeover requests).
             spawn_instance_listener(listener, cc.egui_ctx.clone(), visible.clone(), hwnd);
@@ -1203,6 +1209,7 @@ impl App {
         self.pet_set_enabled(config.pet_enabled);
         self.pet_set_position_offset(config.pet_position_offset);
         self.pet_set_character(config.pet_character);
+        self.apply_icon_style_tray_only(config.icon_style);
         self.config = config;
         self.status = "Reloaded config from disk".to_string();
     }
@@ -1385,6 +1392,47 @@ impl App {
         } else {
             ui.label("Autostart is not available on this platform.");
         }
+    }
+
+    fn apply_icon_style_tray_only(&mut self, style: crate::config::IconStyle) {
+        let (rgba_tray, tw, th) = icon_rgba(style, 128);
+        if let Ok(tray_icon) = tray_icon::Icon::from_rgba(rgba_tray, tw, th) {
+            let _ = self.tray.tray.set_icon(Some(tray_icon));
+        }
+    }
+
+    fn apply_icon_style(&mut self, style: crate::config::IconStyle, ctx: &egui::Context) {
+        self.apply_icon_style_tray_only(style);
+        let (rgba_window, ww, wh) = icon_rgba(style, 256);
+        let icon_data = egui::IconData {
+            rgba: rgba_window,
+            width: ww,
+            height: wh,
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(icon_data))));
+    }
+
+    fn ui_icon_style(&mut self, ui: &mut egui::Ui) {
+        ui.heading("App & Tray Icon");
+        ui.label("Choose the retro companion style for the system tray and window:");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Icon Style:");
+            let mut selected = self.draft.icon_style;
+            egui::ComboBox::from_id_salt("icon_style_picker")
+                .selected_text(selected.display_name())
+                .show_ui(ui, |ui| {
+                    for style in crate::config::IconStyle::ALL {
+                        ui.selectable_value(&mut selected, style, style.display_name());
+                    }
+                });
+            if selected != self.draft.icon_style {
+                self.draft.icon_style = selected;
+                self.apply_icon_style(selected, ui.ctx());
+                ui.ctx().request_repaint();
+            }
+        });
     }
 
     fn ui_pet(&mut self, ui: &mut egui::Ui) {
@@ -1662,6 +1710,8 @@ impl eframe::App for App {
                     ui.group(|ui| self.ui_stability(ui));
                     ui.add_space(6.0);
                     ui.group(|ui| self.ui_startup(ui));
+                    ui.add_space(6.0);
+                    ui.group(|ui| self.ui_icon_style(ui));
                 });
             });
         }
@@ -1729,6 +1779,7 @@ struct Draft {
     pet_enabled: bool,
     pet_position_offset: f32,
     pet_character: crate::pet::character::CharacterKind,
+    icon_style: crate::config::IconStyle,
 }
 
 impl Draft {
@@ -1755,6 +1806,7 @@ impl Draft {
             pet_enabled: config.pet_enabled,
             pet_position_offset: config.pet_position_offset,
             pet_character: config.pet_character,
+            icon_style: config.icon_style,
         }
     }
 
@@ -1782,6 +1834,7 @@ impl Draft {
             pet_enabled: self.pet_enabled,
             pet_position_offset: self.pet_position_offset,
             pet_character: self.pet_character,
+            icon_style: self.icon_style,
         }
     }
 }
@@ -1818,36 +1871,16 @@ fn build_auto_launch() -> Option<AutoLaunch> {
     auto_launch_for(&target)
 }
 
-/// Draw a simple folder icon so no binary asset is needed.
-fn icon_rgba(size: u32) -> (Vec<u8>, u32, u32) {
-    let s = size as f32;
-    let mut px = vec![0u8; (size * size * 4) as usize];
-
-    let (bx0, by0, bx1, by1) = (s * 0.12, s * 0.28, s * 0.88, s * 0.82);
-    let (tx0, ty0, tx1, ty1) = (s * 0.12, s * 0.18, s * 0.48, s * 0.34);
-
-    for y in 0..size {
-        for x in 0..size {
-            let fx = x as f32 + 0.5;
-            let fy = y as f32 + 0.5;
-            let body = in_rounded(fx, fy, bx0, by0, bx1, by1, s * 0.07);
-            let tab = in_rounded(fx, fy, tx0, ty0, tx1, ty1, s * 0.05);
-            if body || tab {
-                let idx = ((y * size + x) * 4) as usize;
-                px[idx] = 59;
-                px[idx + 1] = 130;
-                px[idx + 2] = 246;
-                px[idx + 3] = 255;
-            }
-        }
-    }
-    (px, size, size)
-}
-
-fn in_rounded(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> bool {
-    let cx = x.clamp(x0 + r, x1 - r);
-    let cy = y.clamp(y0 + r, y1 - r);
-    let dx = x - cx;
-    let dy = y - cy;
-    dx * dx + dy * dy <= r * r
+/// Load the chosen bundled retro icon PNG and return it as raw RGBA at the requested size.
+fn icon_rgba(style: crate::config::IconStyle, size: u32) -> (Vec<u8>, u32, u32) {
+    let bytes: &[u8] = match style {
+        crate::config::IconStyle::Calico => include_bytes!("../assets/icon_calico.png"),
+        crate::config::IconStyle::Monochrome => include_bytes!("../assets/icon_mono.png"),
+    };
+    let img = image::load_from_memory(bytes)
+        .expect("bundled icon is invalid")
+        .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    (img.into_raw(), w, h)
 }
