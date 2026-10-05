@@ -183,8 +183,7 @@ pub fn run() -> Result<(), String> {
             .with_inner_size([640.0, 700.0])
             .with_min_inner_size([480.0, 420.0])
             .with_visible(!autostart_launch)
-            .with_icon(viewport_icon)
-            .with_transparent(true),
+            .with_icon(viewport_icon),
         ..Default::default()
     };
 
@@ -267,6 +266,8 @@ fn handle_menu_event(
         ID_OPEN_LOGS => open_path(&config::log_path()),
         ID_QUIT => {
             log::info!("quit requested from tray");
+            // Ask the native pet thread to stop before we tear the process down.
+            crate::pet::request_shutdown();
             // Hard-exit so quitting works even if the window is hidden and no
             // further frame is drawn. Submitted file moves are atomic renames,
             // so there is no partial state to flush.
@@ -337,7 +338,7 @@ fn os_set_visible(hwnd: isize, show: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowLongW, GetWindowRect, SetForegroundWindow, SetWindowLongW, SetWindowPos,
         ShowWindow, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-        SW_HIDE, SW_RESTORE, SW_SHOW, WS_EX_TOOLWINDOW,
+        SW_HIDE, SW_RESTORE, SW_SHOW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
 
     static SAVED_X: AtomicI32 = AtomicI32::new(100);
@@ -349,10 +350,12 @@ fn os_set_visible(hwnd: isize, show: bool) {
     let hwnd = hwnd as HWND;
     unsafe {
         if show {
-            // Restore normal ex-style (not toolwindow, so it appears in taskbar when open)
+            // Restore normal ex-style: drop toolwindow and re-assert appwindow so the
+            // settings window appears in the taskbar / Alt-Tab while it is open.
             ShowWindow(hwnd, SW_HIDE as i32);
             let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_TOOLWINDOW as i32));
+            let ex_style = (ex_style & !(WS_EX_TOOLWINDOW as i32)) | (WS_EX_APPWINDOW as i32);
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
 
             // Restore saved position
             let x = SAVED_X.load(Ordering::SeqCst);
@@ -388,9 +391,13 @@ fn os_set_visible(hwnd: isize, show: bool) {
             // Hide window first so the Windows Taskbar immediately drops the taskbar button
             ShowWindow(hwnd, SW_HIDE as i32);
 
-            // Set as toolwindow so it does not appear on taskbar or alt-tab when shown
+            // Set as toolwindow so it does not appear on taskbar or alt-tab when shown.
+            // WS_EX_APPWINDOW forces a window onto the taskbar/Alt-Tab/Task View and
+            // overrides WS_EX_TOOLWINDOW, so it must be cleared too — otherwise the
+            // parked window keeps showing up in the "all virtual desktops" view.
             let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | (WS_EX_TOOLWINDOW as i32));
+            let ex_style = (ex_style | (WS_EX_TOOLWINDOW as i32)) & !(WS_EX_APPWINDOW as i32);
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
 
             // Park offscreen with SWP_SHOWWINDOW. The window is now shown offscreen as a toolwindow:
             // the Windows Taskbar NEVER shows a button for it, but Windows OS continues message
@@ -410,6 +417,54 @@ fn os_set_visible(hwnd: isize, show: bool) {
 
 #[cfg(not(windows))]
 fn os_set_visible(_hwnd: isize, _show: bool) {}
+
+/// TEMP diagnostic: log frames/sec and average per-frame cost.
+fn record_frame(app: &App, total_ms: f64, pet_update_ms: f64, pet_render_ms: f64) {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    struct Acc {
+        start: Instant,
+        frames: u64,
+        total_ms: f64,
+        pet_update_ms: f64,
+        pet_render_ms: f64,
+    }
+    static STATE: OnceLock<Mutex<Acc>> = OnceLock::new();
+    let state = STATE.get_or_init(|| {
+        Mutex::new(Acc {
+            start: Instant::now(),
+            frames: 0,
+            total_ms: 0.0,
+            pet_update_ms: 0.0,
+            pet_render_ms: 0.0,
+        })
+    });
+    let mut acc = state.lock().unwrap();
+    acc.frames += 1;
+    acc.total_ms += total_ms;
+    acc.pet_update_ms += pet_update_ms;
+    acc.pet_render_ms += pet_render_ms;
+    let elapsed = acc.start.elapsed().as_secs_f64();
+    if elapsed >= 2.0 {
+        let frames = acc.frames as f64;
+        log::debug!(
+            "ui fps {:.1} frame {:.2}ms pet_update {:.2}ms pet_render {:.2}ms pet_enabled={} state={:?} papers={} carried={}",
+            frames / elapsed,
+            acc.total_ms / frames,
+            acc.pet_update_ms / frames,
+            acc.pet_render_ms / frames,
+            app.pet_enabled(),
+            app.pet_state(),
+            app.pet_paper_count(),
+            app.pet_carried_count(),
+        );
+        acc.start = Instant::now();
+        acc.frames = 0;
+        acc.total_ms = 0.0;
+        acc.pet_update_ms = 0.0;
+        acc.pet_render_ms = 0.0;
+    }
+}
 
 /// Brighter, larger text and roomier spacing than the egui defaults.
 fn configure_style(ctx: &egui::Context) {
@@ -612,6 +667,7 @@ fn spawn_instance_listener(
                 }
                 "REPLACE" => {
                     log::info!("a newer instance is taking over; exiting");
+                    crate::pet::request_shutdown();
                     std::process::exit(0);
                 }
                 _ => {}
@@ -714,12 +770,20 @@ struct App {
     last_tray_status: String,
     auto: Option<AutoLaunch>,
     autostart: bool,
+    #[cfg(windows)]
+    native_pet: Option<crate::pet::native::NativePet>,
+    #[cfg(windows)]
+    pet_preview: Option<crate::pet::animation::PetTextures>,
+    #[cfg(windows)]
+    pet_spec: crate::pet::character::CharacterSpec,
+    #[cfg(not(windows))]
     pet: crate::pet::PetController,
     pet_tx: Sender<crate::pet::PetEvent>,
     stage: Stage,
     own_version: &'static str,
     current_version: Option<String>,
     do_install: bool,
+    startup_frame: u32,
 }
 
 impl App {
@@ -752,10 +816,24 @@ impl App {
             }
         }
 
+        #[cfg(windows)]
+        let native_pet =
+            crate::pet::native::NativePet::spawn(config.pet_enabled, 28.0, config.pet_position_offset, pet_rx);
+        #[cfg(windows)]
+        let pet_spec = crate::pet::character::CharacterSpec::for_kind(
+            crate::pet::character::CharacterKind::Slime,
+        );
+        // TODO(linux/macos): replace this egui-viewport fallback with a native
+        // per-pixel-alpha overlay (see the TODOs in `src/pet/mod.rs`) so
+        // transparency and idle CPU match the Windows `pet::native` backend.
+        #[cfg(not(windows))]
         let mut pet = crate::pet::PetController::new(Some(pet_rx));
-        pet.enabled = config.pet_enabled;
-        pet.position_offset = config.pet_position_offset;
-        pet.refresh_taskbar_coords();
+        #[cfg(not(windows))]
+        {
+            pet.enabled = config.pet_enabled;
+            pet.position_offset = config.pet_position_offset;
+            pet.refresh_taskbar_coords();
+        }
 
         App {
             config,
@@ -770,6 +848,13 @@ impl App {
             last_tray_status: String::new(),
             auto,
             autostart,
+            #[cfg(windows)]
+            native_pet: Some(native_pet),
+            #[cfg(windows)]
+            pet_preview: None,
+            #[cfg(windows)]
+            pet_spec,
+            #[cfg(not(windows))]
             pet,
             pet_tx,
             stage: if need_prompt {
@@ -780,6 +865,7 @@ impl App {
             own_version: CURRENT_VERSION,
             current_version,
             do_install: force_install,
+            startup_frame: 0,
         }
     }
 
@@ -877,13 +963,233 @@ impl App {
         apply_visibility(visible, ctx, self.hwnd, &self.visible);
     }
 
+    // -- Desktop pet backend abstraction (native layered window on Windows, egui elsewhere) --
+
+    #[cfg(windows)]
+    fn pet_shared(&self) -> Option<&crate::pet::native::SharedPet> {
+        self.native_pet.as_ref().map(|p| p.shared().as_ref())
+    }
+
+    fn pet_enabled(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.pet_shared().map(|s| s.enabled()).unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.enabled
+        }
+    }
+
+    fn pet_set_enabled(&mut self, value: bool) {
+        #[cfg(windows)]
+        if let Some(shared) = self.pet_shared() {
+            shared.set_enabled(value);
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.enabled = value;
+        }
+    }
+
+    fn pet_state(&self) -> crate::pet::PetState {
+        #[cfg(windows)]
+        {
+            self.pet_shared()
+                .map(|s| s.state())
+                .unwrap_or(crate::pet::PetState::Sleeping)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.state
+        }
+    }
+
+    fn pet_frame(&self) -> usize {
+        #[cfg(windows)]
+        {
+            self.pet_shared().map(|s| s.frame()).unwrap_or(0)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.player.current_frame()
+        }
+    }
+
+    fn pet_facing_left(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.pet_shared().map(|s| s.facing_left()).unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.facing_left
+        }
+    }
+
+    fn pet_is_dragging(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.pet_shared().map(|s| s.dragging()).unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.is_dragging_desk
+        }
+    }
+
+    fn pet_paper_count(&self) -> usize {
+        #[cfg(windows)]
+        {
+            self.pet_shared().map(|s| s.paper_count()).unwrap_or(0)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.ground_papers.len()
+        }
+    }
+
+    fn pet_carried_count(&self) -> usize {
+        #[cfg(windows)]
+        {
+            self.pet_shared().map(|s| s.carried_count()).unwrap_or(0)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.carried_stack.len()
+        }
+    }
+
+    fn pet_speed(&self) -> f32 {
+        #[cfg(windows)]
+        {
+            self.pet_shared().map(|s| s.speed()).unwrap_or(28.0)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.speed
+        }
+    }
+
+    fn pet_set_speed(&mut self, value: f32) {
+        #[cfg(windows)]
+        if let Some(shared) = self.pet_shared() {
+            shared.set_speed(value);
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.speed = value;
+        }
+    }
+
+    fn pet_position_offset(&self) -> f32 {
+        #[cfg(windows)]
+        {
+            self.pet_shared()
+                .map(|s| s.position_offset())
+                .unwrap_or(0.0)
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.position_offset
+        }
+    }
+
+    fn pet_set_position_offset(&mut self, value: f32) {
+        #[cfg(windows)]
+        if let Some(shared) = self.pet_shared() {
+            shared.set_position_offset(value);
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.position_offset = value;
+            self.pet.refresh_taskbar_coords();
+        }
+    }
+
+    fn pet_help_clean(&mut self) {
+        #[cfg(windows)]
+        if let Some(pet) = &self.native_pet {
+            pet.help_clean();
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.help_clean();
+        }
+    }
+
+    fn pet_say_hi(&mut self, text: &str) {
+        #[cfg(windows)]
+        if let Some(pet) = &self.native_pet {
+            pet.say_hi(text.to_string());
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.say_funny(text, 3.0);
+        }
+    }
+
+    fn pet_realign(&mut self) {
+        #[cfg(windows)]
+        if let Some(pet) = &self.native_pet {
+            pet.realign();
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.refresh_taskbar_coords();
+        }
+    }
+
+    fn pet_anim_def(&self) -> crate::pet::character::AnimationDef {
+        let spec = self.pet_spec();
+        match self.pet_state() {
+            crate::pet::PetState::Sleeping => spec.anim_sleep,
+            crate::pet::PetState::Alert => spec.anim_alert,
+            crate::pet::PetState::Collecting
+            | crate::pet::PetState::WalkingToTray
+            | crate::pet::PetState::WalkingHome => spec.anim_walk,
+            crate::pet::PetState::Arranging => spec.anim_drop,
+            crate::pet::PetState::Stuck => spec.anim_alert,
+        }
+    }
+
+    fn pet_spec(&self) -> &crate::pet::character::CharacterSpec {
+        #[cfg(windows)]
+        {
+            &self.pet_spec
+        }
+        #[cfg(not(windows))]
+        {
+            &self.pet.spec
+        }
+    }
+
+    #[cfg(windows)]
+    fn ensure_pet_preview(&mut self, ctx: &egui::Context) {
+        if self.pet_preview.is_none() {
+            self.pet_preview = Some(crate::pet::animation::PetTextures::load(ctx, &self.pet_spec));
+        }
+    }
+    #[cfg(not(windows))]
+    fn ensure_pet_preview(&mut self, _ctx: &egui::Context) {}
+
+    fn pet_textures(&self) -> Option<&crate::pet::animation::PetTextures> {
+        #[cfg(windows)]
+        {
+            self.pet_preview.as_ref()
+        }
+        #[cfg(not(windows))]
+        {
+            self.pet.textures.as_ref()
+        }
+    }
+
     fn reload_from_disk(&mut self) {
         let config = config::load_or_create();
         self.watcher.reload(config.clone());
         self.draft = Draft::from_config(&config);
-        self.pet.enabled = config.pet_enabled;
-        self.pet.position_offset = config.pet_position_offset;
-        self.pet.refresh_taskbar_coords();
+        self.pet_set_enabled(config.pet_enabled);
+        self.pet_set_position_offset(config.pet_position_offset);
         self.config = config;
         self.status = "Reloaded config from disk".to_string();
     }
@@ -893,9 +1199,8 @@ impl App {
         match config.save() {
             Ok(()) => {
                 self.watcher.reload(config.clone());
-                self.pet.enabled = config.pet_enabled;
-                self.pet.position_offset = config.pet_position_offset;
-                self.pet.refresh_taskbar_coords();
+                self.pet_set_enabled(config.pet_enabled);
+                self.pet_set_position_offset(config.pet_position_offset);
                 self.config = config;
                 self.status = "Saved and restarted watcher".to_string();
             }
@@ -1077,12 +1382,13 @@ impl App {
             .checkbox(&mut self.draft.pet_enabled, "Enable desktop pet companion")
             .changed()
         {
-            self.pet.enabled = self.draft.pet_enabled;
+            let enabled = self.draft.pet_enabled;
+            self.pet_set_enabled(enabled);
         }
 
-        if self.pet.enabled {
+        if self.pet_enabled() {
             ui.add_space(4.0);
-            let (state_str, state_color) = match self.pet.state {
+            let (state_str, state_color) = match self.pet_state() {
                 crate::pet::PetState::Sleeping => ("Sleeping near folder zZz", egui::Color32::from_rgb(150, 180, 220)),
                 crate::pet::PetState::Alert => ("Alert! Noticed new file!", egui::Color32::from_rgb(255, 205, 50)),
                 crate::pet::PetState::Collecting => ("Collecting fluttering papers...", egui::Color32::from_rgb(100, 210, 140)),
@@ -1092,19 +1398,22 @@ impl App {
                 crate::pet::PetState::Stuck => ("Stuck! Blocked by files near folder entrance!", egui::Color32::from_rgb(255, 140, 50)),
             };
 
+            self.ensure_pet_preview(ui.ctx());
+            let anim = self.pet_anim_def();
+            let frame = self.pet_frame();
+            let facing = self.pet_facing_left();
+            let preview = self.pet_textures().map(|textures| {
+                (
+                    textures.character.id(),
+                    textures.char_uv(self.pet_spec(), &anim, frame, facing),
+                )
+            });
+            let speed_text = self.pet_speed();
+
             ui.horizontal(|ui| {
-                if let Some(ref textures) = self.pet.textures {
-                    let frame = self.pet.player.current_frame();
-                    let anim_def = match self.pet.state {
-                        crate::pet::PetState::Sleeping => &self.pet.spec.anim_sleep,
-                        crate::pet::PetState::Alert => &self.pet.spec.anim_alert,
-                        crate::pet::PetState::Collecting | crate::pet::PetState::WalkingToTray | crate::pet::PetState::WalkingHome => &self.pet.spec.anim_walk,
-                        crate::pet::PetState::Arranging => &self.pet.spec.anim_drop,
-                        crate::pet::PetState::Stuck => &self.pet.spec.anim_alert,
-                    };
-                    let uv = textures.char_uv(&self.pet.spec, anim_def, frame, self.pet.facing_left);
+                if let Some((tex_id, uv)) = preview {
                     let img = egui::Image::from_texture(egui::load::SizedTexture::new(
-                        textures.character.id(),
+                        tex_id,
                         egui::vec2(36.0, 36.0),
                     ))
                     .uv(uv);
@@ -1115,14 +1424,20 @@ impl App {
                         ui.label("Status:");
                         ui.colored_label(state_color, state_str);
                     });
-                    ui.label(format!("Speed: {:.0} px/s", self.pet.speed));
+                    ui.label(format!("Speed: {:.0} px/s", speed_text));
                 });
             });
 
             ui.add_space(4.0);
+            let mut speed = speed_text;
             ui.horizontal(|ui| {
                 ui.label("Stroll speed:");
-                ui.add(egui::Slider::new(&mut self.pet.speed, 15.0..=60.0).suffix(" px/s"));
+                if ui
+                    .add(egui::Slider::new(&mut speed, 15.0..=60.0).suffix(" px/s"))
+                    .changed()
+                {
+                    self.pet_set_speed(speed);
+                }
             });
 
             ui.add_space(4.0);
@@ -1137,8 +1452,8 @@ impl App {
                     .on_hover_text("Shift Mochi and the folder desk together along the taskbar")
                     .changed()
                 {
-                    self.pet.position_offset = self.draft.pet_position_offset;
-                    self.pet.refresh_taskbar_coords();
+                    let offset = self.draft.pet_position_offset;
+                    self.pet_set_position_offset(offset);
                     ui.ctx().request_repaint();
                 }
             });
@@ -1164,7 +1479,7 @@ impl App {
                     .on_hover_text("Clear all papers and celebrate with Mochi")
                     .clicked()
                 {
-                    self.pet.help_clean();
+                    self.pet_help_clean();
                     ui.ctx().request_repaint();
                 }
                 if ui
@@ -1172,7 +1487,7 @@ impl App {
                     .on_hover_text("Make Mochi say a friendly line")
                     .clicked()
                 {
-                    self.pet.say_funny("yoo bro! ready to sort files!", 3.0);
+                    self.pet_say_hi("yoo bro! ready to sort files!");
                     ui.ctx().request_repaint();
                 }
                 if ui
@@ -1180,7 +1495,7 @@ impl App {
                     .on_hover_text("Refresh screen and taskbar bounds")
                     .clicked()
                 {
-                    self.pet.refresh_taskbar_coords();
+                    self.pet_realign();
                     ui.ctx().request_repaint();
                 }
             });
@@ -1190,9 +1505,29 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = std::time::Instant::now();
+        #[allow(unused_mut)]
+        let mut pet_update_ms = 0.0_f64;
+        #[allow(unused_mut)]
+        let mut pet_render_ms = 0.0_f64;
         if self.stage == Stage::Prompt {
             self.ui_prompt(ctx);
             return;
+        }
+
+        // eframe always shows the root window once, after the first painted
+        // frame, even when it was created with `with_visible(false)`. On a
+        // hidden autostart launch that leaves a blank, transparent window on
+        // screen. That forced show also makes winit re-apply its cached window
+        // styles, so we must park the window again on the following frame.
+        self.startup_frame = self.startup_frame.saturating_add(1);
+        if !self.visible.load(Ordering::SeqCst) && self.startup_frame <= 2 {
+            // Park immediately (avoids a one-frame transparent flash) and again
+            // on the next frame to undo the style reset from eframe's forced show.
+            self.set_visible(false, ctx);
+            if self.startup_frame == 1 {
+                ctx.request_repaint();
+            }
         }
 
         if self.do_install {
@@ -1214,15 +1549,43 @@ impl eframe::App for App {
 
         self.sync_tray();
 
-        // Update and render desktop companion
-        if self.pet.enabled {
-            let delay = self.pet.update();
-            ctx.request_repaint_after(delay);
-            self.pet.render(ctx);
+        // Update and render desktop companion.
+        //
+        // On Windows the pet lives in its own native layered window on a
+        // dedicated thread (see `pet::native`), so eframe must not draw it. We
+        // only repaint the settings UI while it is visible to animate the small
+        // companion preview, and mirror any desktop drag position into the draft.
+        #[cfg(windows)]
+        {
+            if self.pet_is_dragging() {
+                self.draft.pet_position_offset = self.pet_position_offset();
+            }
+            if self.visible.load(Ordering::SeqCst) && self.pet_enabled() {
+                // Gentle repaint for the small companion preview; the real pet
+                // animates natively. Keep this slow to avoid idle CPU churn.
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
 
-            // Sync dragged position from desktop to draft settings
-            if self.pet.is_dragging_desk {
-                self.draft.pet_position_offset = self.pet.position_offset;
+        #[cfg(not(windows))]
+        {
+            if self.pet.enabled {
+                let pet_start = std::time::Instant::now();
+                let delay = self.pet.update();
+                pet_update_ms = pet_start.elapsed().as_secs_f64() * 1000.0;
+                // Smooth 60fps animation. egui subtracts the predicted frame time
+                // from the requested delay, so add it back to land on a 60fps period.
+                let predicted = Duration::from_secs_f32(ctx.input(|i| i.predicted_dt));
+                let budget = Duration::from_secs_f32(1.0 / 60.0) + predicted;
+                ctx.request_repaint_after(delay.max(budget));
+                let render_start = std::time::Instant::now();
+                self.pet.render(ctx);
+                pet_render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+
+                // Sync dragged position from desktop to draft settings
+                if self.pet.is_dragging_desk {
+                    self.draft.pet_position_offset = self.pet.position_offset;
+                }
             }
         }
 
@@ -1234,9 +1597,8 @@ impl eframe::App for App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Revert").clicked() {
                             self.draft = Draft::from_config(&self.config);
-                            self.pet.enabled = self.config.pet_enabled;
-                            self.pet.position_offset = self.config.pet_position_offset;
-                            self.pet.refresh_taskbar_coords();
+                            self.pet_set_enabled(self.config.pet_enabled);
+                            self.pet_set_position_offset(self.config.pet_position_offset);
                             self.status = "Reverted unsaved changes".to_string();
                         }
                         let dirty = self.is_dirty();
@@ -1268,6 +1630,13 @@ impl eframe::App for App {
                 });
             });
         }
+
+        record_frame(
+            self,
+            frame_start.elapsed().as_secs_f64() * 1000.0,
+            pet_update_ms,
+            pet_render_ms,
+        );
     }
 }
 

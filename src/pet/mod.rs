@@ -5,6 +5,29 @@ pub mod animation;
 pub mod character;
 pub mod taskbar;
 
+#[cfg(windows)]
+pub mod native;
+
+// TODO(linux): provide a native per-pixel-alpha overlay so the pet is genuinely
+// transparent and cheap, like the Windows `native` backend. Options:
+//   * X11: an override-redirect window with a 32-bit ARGB visual (compositor),
+//     no decorations, `_NET_WM_WINDOW_TYPE_DOCK`.
+//   * Wayland: a `wlr-layer-shell` surface in the overlay layer.
+// Until then Linux uses the egui immediate-viewport fallback below.
+//
+// TODO(macos): provide a native overlay too: an `NSWindow` with
+// `isOpaque = NO`, `backgroundColor = clear`, `ignoresMouseEvents = YES`,
+// level = `.statusBar`/`.floating`, presented off the main thread.
+// Until then macOS uses the egui immediate-viewport fallback below.
+
+/// Ask the native pet thread to stop, if one is running.
+#[cfg(windows)]
+pub use native::request_shutdown;
+
+/// No native pet on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn request_shutdown() {}
+
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -730,9 +753,11 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
         let char_w = self.spec.frame_width as f32 * self.scale;
         let char_h = self.spec.frame_height as f32 * self.scale;
 
-        // Viewport bounds: transparent strip covering full paper drop and walk zone
-        let strip_x = (self.folder_x - 320.0).min(self.current_x - 40.0).max(0.0);
-        let strip_w = ((self.folder_x + 80.0) - strip_x).max(420.0);
+        // Fixed, generous overlay covering the whole paper-drop/walk zone.
+        // It must stay constant: moving/resizing the window every frame forces
+        // the GL surface to be recreated each frame, which pegs a CPU core.
+        let strip_x = (self.folder_x - 400.0).max(0.0);
+        let strip_w = ((self.folder_x + 120.0) - strip_x).max(440.0);
         let strip_y = self.current_y - 85.0;
         let strip_h = 145.0;
 
@@ -748,13 +773,6 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
                 .with_inner_size([strip_w, strip_h])
                 .with_position([strip_x, strip_y]),
             |sub_ctx, _class| {
-                // Apply desktop transparency styles to the HWND
-                taskbar::apply_pet_window_transparency("DirWatcherPet");
-
-                sub_ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
-                sub_ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-                sub_ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-
                 egui::Area::new(egui::Id::new("pet_viewport_area"))
                     .fixed_pos(Pos2::ZERO)
                     .show(sub_ctx, |ui| {

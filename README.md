@@ -123,15 +123,23 @@ extension/category match, are left alone.
 
 ## Autostart
 
-Use **Start automatically on login** in the settings window. This uses the
-platform's native mechanism:
+Use **Start automatically on login** in the settings window, or install the app
+(the **Install** prompt / `--install`) which enables it automatically. This uses
+the platform's native mechanism:
 
 - **Linux/BSD**: an XDG autostart `.desktop` file in `~/.config/autostart/`
 - **Windows**: a `HKCU\...\CurrentVersion\Run` registry entry
 - **macOS**: a `LaunchAgent` plist
 
-The `scripts/*.ps1` Scheduled Task from earlier versions still works but is now
-legacy — use either the in-app toggle or the scripts, not both.
+The registered entry points at the **installed** copy and starts it hidden in
+the tray. There is no separate installer script to run — the executable copies
+itself into place, registers autostart, and takes over any older running
+instance.
+
+To uninstall, turn off autostart in the settings window, quit from the tray, and
+delete the install folder (`%LOCALAPPDATA%\Programs\watch-folder` on Windows,
+`~/.local/bin/watch-folder` on Linux, `~/Applications/watch-folder` on macOS)
+along with `~/.config/watch-dir/`.
 
 ## Linux tray notes
 

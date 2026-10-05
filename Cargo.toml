@@ -1,6 +1,6 @@
 [package]
 name = "watch-folder"
-version = "0.2.6"
+version = "0.2.8"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -19,7 +19,18 @@ raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
+# Only for the GDI+ flat API used by the native per-pixel-alpha pet overlay.
+# (Already present transitively via eframe/wgpu, so this is cheap.)
+windows = { version = "0.58", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_GdiPlus",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # StatusNotifierItem (D-Bus) backend avoids the GTK/libappindicator build deps.

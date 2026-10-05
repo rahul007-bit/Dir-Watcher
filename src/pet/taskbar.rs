@@ -117,46 +117,6 @@ pub fn get_taskbar_info() -> Option<TaskbarInfo> {
 }
 
 #[cfg(windows)]
-pub fn apply_pet_window_transparency(title: &str) -> bool {
-    use std::sync::atomic::{AtomicIsize, Ordering};
-    static LAST_HWND: AtomicIsize = AtomicIsize::new(0);
-
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW,
-        GWL_EXSTYLE, LWA_COLORKEY, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
-    };
-
-    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title_wide.as_ptr());
-        if hwnd != std::ptr::null_mut() {
-            let hwnd_val = hwnd as isize;
-            if LAST_HWND.load(Ordering::SeqCst) == hwnd_val {
-                return true;
-            }
-
-            // Apply layered, toolwindow (no taskbar item / no alt-tab), and transparent (desktop pass-through)
-            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-            let new_style = ex_style | (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT) as i32;
-            SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
-
-            // Colorkey: Treat black 0x00000000 (0,0,0) as 100% transparent desktop alpha!
-            SetLayeredWindowAttributes(hwnd, 0x00000000, 255, LWA_COLORKEY);
-
-            LAST_HWND.store(hwnd_val, Ordering::SeqCst);
-            log::info!("Applied desktop layered colorkey transparency to pet window: {hwnd_val}");
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(not(windows))]
-pub fn apply_pet_window_transparency(_title: &str) -> bool {
-    false
-}
-
-#[cfg(windows)]
 pub fn get_global_cursor_pos() -> Option<(f32, f32)> {
     use windows_sys::Win32::Foundation::POINT;
     extern "system" {
