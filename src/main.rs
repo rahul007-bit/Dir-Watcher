@@ -54,7 +54,12 @@ fn init_file_logging() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    // Default to warnings from everything, but keep our own crate at info. The
+    // D-Bus/zbus stack logs every message at info; leaving it enabled floods the
+    // log file (and CPU) on Linux and makes the UI sluggish.
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,watch_folder=info"),
+    );
     match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(file) => {
             let _ = builder.target(env_logger::Target::Pipe(Box::new(file))).try_init();

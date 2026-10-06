@@ -35,6 +35,18 @@ windows = { version = "0.58", default-features = false, features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 # StatusNotifierItem (D-Bus) backend avoids the GTK/libappindicator build deps.
 tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+# Used to force the X11/XWayland backend on Linux: GNOME Wayland forbids
+# clients from positioning or raising their own windows, which the desktop
+# pet needs. Same version as eframe's winit, so the types unify.
+winit = { version = "0.30", default-features = false, features = ["x11"] }
+# dlopen probe for libxkbcommon-x11, which winit's X11 backend needs and which
+# a Wayland-only system may lack; without it we must stay on Wayland.
+libc = "0.2"
+# Global pointer/button polling for dragging the pet and clicking papers on X11
+# (pure Rust; already in the tree via winit's X11 backend). XInput2 raw events
+# are needed because ordinary pointer queries do not see clicks that land on a
+# Wayland surface (which is exactly what a click-through overlay does).
+x11rb = { version = "0.13", features = ["xinput"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = { version = "0.26", default-features = false }

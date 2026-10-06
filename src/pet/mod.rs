@@ -119,10 +119,17 @@ pub struct PetController {
     pub sweat_timer: f32,
     pub thank_timer: f32,  // Heart / Thank you badge duration
     pub window_initialized: bool,
+    /// Whether we have asked the window manager to keep the pet out of the
+    /// taskbar / Activities overview (winit doesn't do this on Linux).
+    pub pet_window_styled: bool,
     pub sparkle_bursts: Vec<(f32, f32, f32)>, // (x, y, remaining_secs)
 
     // Coordinate scaling and positioning
     pub ppp: f32,
+    /// Current monitor size in logical points, learned from egui. Non-Windows
+    /// platforms have no Windows-style taskbar to query, so the pet anchors to
+    /// the bottom edge of this monitor instead of a hard-coded rectangle.
+    pub screen_size: Option<(f32, f32)>,
     pub was_lbutton_down: bool,
 
     // Context-aware speech dialogue
@@ -177,8 +184,10 @@ impl PetController {
             sweat_timer: 0.0,
             thank_timer: 0.0,
             window_initialized: false,
+            pet_window_styled: false,
             sparkle_bursts: Vec::new(),
             ppp: 1.0,
+            screen_size: None,
             was_lbutton_down: false,
             speech_text: None,
             speech_timer: 0.0,
@@ -270,8 +279,33 @@ impl PetController {
         self.say_funny(quotes[idx], 3.5);
     }
 
-    /// Refresh taskbar coordinates using logical DPI scale factor.
+    /// Distance in logical points between the sprite's feet and the very bottom
+    /// of the screen when anchored to a desktop edge.
+    const BOTTOM_MARGIN: f32 = 2.0;
+
+    /// Refresh the pet's anchor coordinates.
+    ///
+    /// On non-Windows platforms there is no Windows-style taskbar rectangle to
+    /// query, so the pet rests on the bottom edge of the monitor reported by
+    /// egui (`screen_size`, in logical points). Windows uses the native pet
+    /// backend and never reaches this path.
     pub fn refresh_taskbar_coords(&mut self) {
+        if let Some((screen_w, screen_h)) = self.screen_size {
+            let baseline_top = (screen_h - Self::BOTTOM_MARGIN).max(0.0);
+            let tray_x = (screen_w - 100.0).max(120.0);
+
+            self.target_tray_x = tray_x;
+            self.folder_x = tray_x - 38.0 + self.position_offset;
+            self.home_x = self.folder_x - 24.0;
+            // The sprite baseline in its 32px frame sits at y = 30, so this puts
+            // its feet right on the bottom edge of the screen.
+            self.current_y = baseline_top - 30.0;
+            if matches!(self.state, PetState::Sleeping | PetState::Grooming) {
+                self.current_x = self.home_x;
+            }
+            return;
+        }
+
         if let Some(tb) = get_taskbar_info() {
             self.taskbar_info = Some(tb);
             let ppp = self.ppp.max(0.5);
@@ -295,6 +329,9 @@ impl PetController {
         if self.last_taskbar_check.elapsed() > Duration::from_secs(3) {
             self.last_taskbar_check = Instant::now();
             self.refresh_taskbar_coords();
+            // Re-assert this in case the window was only created after our
+            // first attempt, or the compositor restarted.
+            taskbar::x11_set_skip_taskbar("DirWatcherPet", true);
         }
     }
 
@@ -388,6 +425,10 @@ impl PetController {
             }
         }
 
+        // The overlay is click-through, so pointer events never reach it; we
+        // poll the global pointer instead. The button state comes from XInput2
+        // raw events (see `taskbar`), which — unlike `QueryPointer` — do see
+        // clicks that land on a Wayland surface.
         let lbutton_down = taskbar::is_lbutton_pressed();
         let lbutton_clicked = lbutton_down && !self.was_lbutton_down;
         self.was_lbutton_down = lbutton_down;
@@ -401,20 +442,24 @@ impl PetController {
 
                 if lbutton_down {
                     if !self.is_dragging_desk {
-                        // Check if cursor clicked within Mochi or folder desk area
                         let desk_min_x = self.home_x - 14.0;
                         let desk_max_x = self.folder_x + 30.0;
                         let desk_min_y = self.current_y - 12.0;
                         let desk_max_y = self.current_y + 36.0;
 
-                        if cursor_x >= desk_min_x && cursor_x <= desk_max_x && cursor_y >= desk_min_y && cursor_y <= desk_max_y {
+                        if cursor_x >= desk_min_x
+                            && cursor_x <= desk_max_x
+                            && cursor_y >= desk_min_y
+                            && cursor_y <= desk_max_y
+                        {
                             self.is_dragging_desk = true;
                             self.drag_start_cursor_x = cursor_x;
                             self.drag_start_offset = self.position_offset;
                         }
                     } else {
                         let delta = cursor_x - self.drag_start_cursor_x;
-                        self.position_offset = (self.drag_start_offset + delta).clamp(-1200.0, 300.0);
+                        self.position_offset =
+                            (self.drag_start_offset + delta).clamp(-1200.0, 300.0);
                         self.refresh_taskbar_coords();
                     }
                 } else if self.is_dragging_desk {
@@ -449,10 +494,11 @@ impl PetController {
                     let paper = self.ground_papers.remove(idx);
                     self.sparkle_bursts.push((paper.x, paper.current_y, 0.7));
 
-                    // Check if there are still any papers blocking the doorway
-                    let still_blocked = self.ground_papers.iter().any(|p| p.landed && (p.x - self.folder_x).abs() <= 28.0);
+                    let still_blocked = self
+                        .ground_papers
+                        .iter()
+                        .any(|p| p.landed && (p.x - self.folder_x).abs() <= 28.0);
 
-                    // Only unblock Mochi and say thank you once ALL blocking papers are cleared!
                     if self.state == PetState::Stuck && !still_blocked {
                         self.state = if !self.carried_stack.is_empty() {
                             PetState::WalkingToTray
@@ -753,7 +799,17 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
         }
 
         let ppp = ctx.pixels_per_point().max(0.5);
-        if (self.ppp - ppp).abs() > 0.01 || !self.window_initialized {
+        // Learn the monitor size (logical points) so the pet can anchor to the
+        // real bottom edge instead of a hard-coded rectangle.
+        if let Some(size) = ctx.input(|i| i.viewport().monitor_size) {
+            if size.x > 1.0 && size.y > 1.0 {
+                self.screen_size = Some((size.x, size.y));
+            }
+        }
+        if (self.ppp - ppp).abs() > 0.01
+            || !self.window_initialized
+            || self.screen_size.is_none()
+        {
             self.ppp = ppp;
             self.refresh_taskbar_coords();
             self.window_initialized = true;
@@ -762,7 +818,9 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
         if self.textures.is_none() {
             self.textures = Some(PetTextures::load(ctx, &self.spec));
         }
-        let textures = self.textures.as_ref().unwrap();
+        // Owned clone so the closure below can still borrow `self` mutably to
+        // handle dragging (TextureHandles are cheap Arc clones).
+        let textures = self.textures.as_ref().unwrap().clone();
 
         let anim_def = match self.state {
             PetState::Sleeping => &self.spec.anim_sleep,
@@ -786,8 +844,13 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
         // the GL surface to be recreated each frame, which pegs a CPU core.
         let strip_x = (self.folder_x - 400.0).max(0.0);
         let strip_w = ((self.folder_x + 120.0) - strip_x).max(440.0);
-        let strip_y = self.current_y - 85.0;
         let strip_h = 145.0;
+        let mut strip_y = self.current_y - 85.0;
+        // Keep the overlay fully on-screen (its natural height would otherwise
+        // hang ~28px below the bottom edge once anchored there).
+        if let Some((_, screen_h)) = self.screen_size {
+            strip_y = strip_y.min((screen_h - strip_h).max(0.0)).max(0.0);
+        }
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("desktop_pet_viewport"),
@@ -1100,6 +1163,15 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
                 );
             },
         );
+
+        // The pet overlay must never appear in the taskbar or Activities
+        // overview. winit ignores `with_taskbar(false)` on Linux, so set the
+        // EWMH state ourselves once the window exists (re-applied periodically
+        // in `refresh_taskbar`).
+        if !self.pet_window_styled {
+            taskbar::x11_set_skip_taskbar("DirWatcherPet", true);
+            self.pet_window_styled = true;
+        }
     }
 }
 

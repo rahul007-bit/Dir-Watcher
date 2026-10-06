@@ -31,6 +31,22 @@ const INSTANCE_PORT: u16 = 49717;
 /// Passed to the binary by the autostart entry so it starts hidden (tray only).
 const AUTOSTART_ARG: &str = "--autostart";
 
+/// Can winit's X11 backend run here? It needs an X server (XWayland) and the
+/// `libxkbcommon-x11` shared library that it dlopens for its keymap. The latter
+/// is not installed on every Wayland-only desktop, so probe for it explicitly
+/// rather than crashing when winit tries to load it.
+#[cfg(target_os = "linux")]
+fn x11_backend_available() -> bool {
+    let has_display = std::env::var_os("DISPLAY")
+        .map(|d| !d.is_empty())
+        .unwrap_or(false);
+    if !has_display {
+        return false;
+    }
+    let name = std::ffi::CString::new("libxkbcommon-x11.so.0").unwrap();
+    unsafe { !libc::dlopen(name.as_ptr(), libc::RTLD_LAZY).is_null() }
+}
+
 fn has_arg(name: &str) -> bool {
     std::env::args().any(|a| a == name)
 }
@@ -146,6 +162,7 @@ pub fn run() -> Result<(), String> {
     };
 
     let config = config::load_or_create();
+    install_desktop_entry(config.icon_style);
     let paused = Arc::new(AtomicBool::new(false));
     let visible = Arc::new(AtomicBool::new(!autostart_launch));
 
@@ -170,9 +187,11 @@ pub fn run() -> Result<(), String> {
             None => true,
         };
 
-    // 256 px gives the OS plenty of pixels to scale the title-bar / taskbar icon
-    // cleanly on every DPI setting (100 % – 200 % and beyond).
-    let (rgba_window, ww, wh) = icon_rgba(config.icon_style, 256);
+    // 128 px is enough for the title-bar / taskbar icon at up to 400 % scaling,
+    // and keeps the `_NET_WM_ICON` X11 request comfortably under the 256 KiB
+    // protocol limit (a 256 px icon needs Big-Requests, which some servers or
+    // compositors silently drop, leaving the taskbar icon blank).
+    let (rgba_window, ww, wh) = icon_rgba(config.icon_style, 128);
     let viewport_icon = egui::IconData {
         rgba: rgba_window,
         width: ww,
@@ -183,15 +202,48 @@ pub fn run() -> Result<(), String> {
     // while still keeping the buffer small enough for the tray-icon crate.
     let (rgba_tray, tw, th) = icon_rgba(config.icon_style, 128);
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("watch-folder")
-            .with_inner_size([640.0, 700.0])
-            .with_min_inner_size([480.0, 420.0])
-            .with_visible(!autostart_launch)
-            .with_icon(viewport_icon),
+    let root_viewport = egui::ViewportBuilder::default()
+        .with_title("watch-folder")
+        .with_app_id("watch-folder")
+        .with_inner_size([640.0, 700.0])
+        .with_min_inner_size([480.0, 420.0])
+        .with_visible(!autostart_launch)
+        .with_icon(viewport_icon);
+    // The root window's GL config decides whether an alpha channel exists at
+    // all (see the DESKTOP_PET_GUIDE note). The desktop pet is drawn in a
+    // transparent child viewport, so without this the whole ego GL config has
+    // no alpha bits and the pet falls back to an opaque black rectangle. The
+    // settings UI paints its own opaque panels, so this is invisible there.
+    #[cfg(not(windows))]
+    let root_viewport = root_viewport.with_transparent(true);
+
+    let mut native_options = eframe::NativeOptions {
+        viewport: root_viewport,
         ..Default::default()
     };
+
+    // GNOME on Wayland does not let a client position, raise, or click-through
+    // its own windows (winit's `set_outer_position`/`set_window_level` are
+    // no-ops there). The desktop pet relies on all three, so when an X server
+    // (XWayland) is available we run the whole UI through X11 instead, where
+    // those calls are honoured. A pure-Wayland session, or one missing the
+    // library winit's X11 backend needs, falls back to the Wayland backend.
+    #[cfg(target_os = "linux")]
+    {
+        if x11_backend_available() {
+            native_options.event_loop_builder = Some(Box::new(|builder| {
+                use winit::platform::x11::EventLoopBuilderExtX11 as _;
+                builder.with_x11();
+            }));
+            log::info!("using X11 (XWayland) backend for window placement");
+        } else {
+            log::warn!(
+                "X11/XWayland backend unavailable (install libxkbcommon-x11-0); \
+                 staying on Wayland, where the desktop pet cannot be positioned \
+                 or kept on top"
+            );
+        }
+    }
 
     eframe::run_native(
         "watch-folder",
@@ -320,10 +372,39 @@ fn apply_visibility(show: bool, ctx: &egui::Context, hwnd: isize, visible: &Arc<
     os_set_visible(hwnd, show);
     #[cfg(not(windows))]
     {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
         if show {
+            // Restore the size and place the window back where it was.
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                SETTINGS_MIN_SIZE[0],
+                SETTINGS_MIN_SIZE[1],
+            )));
+            if let Some(size) = *SAVED_WINDOW_SIZE.lock().unwrap() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+            if let Some(pos) = *SAVED_WINDOW_POS.lock().unwrap() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        } else {
+            // Collapse to a single transparent pixel instead of unmapping it.
+            // Unmapping stops eframe's redraw loop on Linux (freezing the
+            // desktop pet), and GNOME's window manager refuses to park a window
+            // off-screen, so the old "move to -32000" trick left a transparent
+            // rectangle on screen. A 1x1 transparent window is invisible yet
+            // keeps the event loop alive so the pet keeps animating.
+            if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+                *SAVED_WINDOW_POS.lock().unwrap() = Some(r.min);
+            }
+            if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
+                *SAVED_WINDOW_SIZE.lock().unwrap() = Some(r.size());
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(1.0, 1.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
         }
+        // Keep the collapsed window out of the dock and Activities overview.
+        crate::pet::taskbar::x11_set_skip_taskbar("watch-folder", !show);
     }
     #[cfg(windows)]
     {
@@ -333,6 +414,18 @@ fn apply_visibility(show: bool, ctx: &egui::Context, hwnd: isize, visible: &Arc<
     }
     ctx.request_repaint();
 }
+
+/// The settings window's normal minimum size, restored when it is shown again.
+#[cfg(not(windows))]
+const SETTINGS_MIN_SIZE: [f32; 2] = [480.0, 420.0];
+
+/// Last on-screen position of the settings window, saved before parking it.
+#[cfg(not(windows))]
+static SAVED_WINDOW_POS: std::sync::Mutex<Option<egui::Pos2>> = std::sync::Mutex::new(None);
+
+/// Last inner size of the settings window, saved before shrinking it.
+#[cfg(not(windows))]
+static SAVED_WINDOW_SIZE: std::sync::Mutex<Option<egui::Vec2>> = std::sync::Mutex::new(None);
 
 #[cfg(windows)]
 fn os_set_visible(hwnd: isize, show: bool) {
@@ -1403,7 +1496,8 @@ impl App {
 
     fn apply_icon_style(&mut self, style: crate::config::IconStyle, ctx: &egui::Context) {
         self.apply_icon_style_tray_only(style);
-        let (rgba_window, ww, wh) = icon_rgba(style, 256);
+        install_desktop_entry(style);
+        let (rgba_window, ww, wh) = icon_rgba(style, 128);
         let icon_data = egui::IconData {
             rgba: rgba_window,
             width: ww,
@@ -1612,6 +1706,13 @@ impl eframe::App for App {
             }
         }
 
+        // Re-assert the window icon explicitly. Some backends (notably X11)
+        // do not apply the icon passed to the initial viewport builder, which
+        // leaves the taskbar/dock entry showing an empty icon.
+        if self.startup_frame == 1 {
+            self.apply_icon_style(self.config.icon_style, ctx);
+        }
+
         if self.do_install {
             self.do_install = false;
             self.run_install();
@@ -1655,10 +1756,11 @@ impl eframe::App for App {
                 let pet_start = std::time::Instant::now();
                 let delay = self.pet.update();
                 pet_update_ms = pet_start.elapsed().as_secs_f64() * 1000.0;
-                // Smooth 60fps animation. egui subtracts the predicted frame time
-                // from the requested delay, so add it back to land on a 60fps period.
-                let predicted = Duration::from_secs_f32(ctx.input(|i| i.predicted_dt));
-                let budget = Duration::from_secs_f32(1.0 / 60.0) + predicted;
+                // Target a 60fps period for the smooth sub-pixel pet motion.
+                // Do NOT add egui's predicted frame time here: on Linux that
+                // doubles the requested period and halves the frame rate to
+                // ~30fps, which reads as choppy.
+                let budget = Duration::from_secs_f32(1.0 / 60.0);
                 ctx.request_repaint_after(delay.max(budget));
                 let render_start = std::time::Instant::now();
                 self.pet.render(ctx);
@@ -1870,6 +1972,53 @@ fn build_auto_launch() -> Option<AutoLaunch> {
     };
     auto_launch_for(&target)
 }
+
+/// Write the icon and a matching desktop entry for the current user.
+///
+/// GNOME's dock/taskbar matches a window to a `.desktop` file by app id /
+/// WM_CLASS and shows *that* file's icon; the window's own icon is ignored. So
+/// without this the entry falls back to a generic gear icon. This is
+/// idempotent and cheap, and is re-run whenever the icon style changes.
+#[cfg(target_os = "linux")]
+fn install_desktop_entry(style: crate::config::IconStyle) {
+    let Some(home) = home::home_dir() else {
+        return;
+    };
+    let icon_dir = home.join(".local/share/watch-folder");
+    let app_dir = home.join(".local/share/applications");
+    if std::fs::create_dir_all(&icon_dir).is_err() || std::fs::create_dir_all(&app_dir).is_err() {
+        return;
+    }
+
+    let icon_bytes: &[u8] = match style {
+        crate::config::IconStyle::Calico => include_bytes!("../assets/icon_calico.png"),
+        crate::config::IconStyle::Monochrome => include_bytes!("../assets/icon_mono.png"),
+    };
+    let icon_path = icon_dir.join("icon.png");
+    if std::fs::write(&icon_path, icon_bytes).is_err() {
+        return;
+    }
+
+    let exec = std::env::current_exe().unwrap_or_default();
+    let desktop = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Version=1.0\n\
+         Name=watch-folder\n\
+         Comment=Sort new files into folders\n\
+         Exec=\"{}\"\n\
+         Icon={}\n\
+         Terminal=false\n\
+         Categories=Utility;\n\
+         StartupWMClass=watch-folder\n",
+        exec.display(),
+        icon_path.display()
+    );
+    let _ = std::fs::write(app_dir.join("watch-folder.desktop"), desktop);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_desktop_entry(_style: crate::config::IconStyle) {}
 
 /// Load the chosen bundled retro icon PNG and return it as raw RGBA at the requested size.
 fn icon_rgba(style: crate::config::IconStyle, size: u32) -> (Vec<u8>, u32, u32) {

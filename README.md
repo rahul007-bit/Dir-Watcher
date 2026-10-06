@@ -150,6 +150,27 @@ along with `~/.config/watch-dir/`.
 - Stock **GNOME hides tray icons**. Install the *AppIndicator and
   KStatusNotifierItem Support* GNOME extension, or run with `--headless`.
 
+### Desktop pet on Linux (XWayland)
+
+The desktop pet anchors itself to the bottom of the screen, stays always on
+top, and can be dragged with the mouse. GNOME's Wayland session does not let a
+normal app position, raise, or make its window click-through, so the app
+switches to the X11 backend (XWayland) when an X server is available.
+
+That backend needs one extra runtime library:
+
+```
+sudo apt install libxkbcommon-x11-0
+```
+
+Without it the app stays on native Wayland: file sorting and the tray still
+work, but the pet cannot be positioned or kept on top.
+
+A desktop entry and icon are written to `~/.local/share/applications` and
+`~/.local/share/watch-folder` on startup, so the taskbar/dock shows the app's
+own icon instead of a generic placeholder. GNOME matches the window to that
+entry by its app id / `WM_CLASS` (`watch-folder`).
+
 ## Windows build notes
 
 The tray/GUI stack needs the MSVC linker. Install **Visual Studio Build Tools**

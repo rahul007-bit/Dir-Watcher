@@ -65,6 +65,7 @@ impl AnimationPlayer {
     }
 }
 
+#[derive(Clone)]
 pub struct PetTextures {
     pub character: TextureHandle,
     pub file_icon: TextureHandle,
