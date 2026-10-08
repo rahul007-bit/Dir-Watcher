@@ -766,9 +766,26 @@ fn running_version() -> Option<String> {
     let mut stream = connect_instance()?;
     stream.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
     writeln!(stream, "HELLO {CURRENT_VERSION}").ok()?;
-    let mut buf = [0u8; 128];
-    let n = stream.read(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf[..n]);
+    // Read up to the newline (or EOF): the reply can arrive split across
+    // several TCP segments, and a single `read` used to lose the tail of the
+    // version number — which silently broke update detection.
+    let mut text = String::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                text.push(byte[0] as char);
+                if text.len() > 64 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
     text.trim()
         .strip_prefix("VERSION ")
         .map(|v| v.trim().to_string())
@@ -782,22 +799,36 @@ fn spawn_instance_listener(
 ) {
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            let mut buf = [0u8; 128];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let text = String::from_utf8_lossy(&buf[..n]);
-            match text.trim() {
-                command if command.starts_with("HELLO") => {
-                    let _ = writeln!(stream, "VERSION {CURRENT_VERSION}");
+            // Read the whole command line: a single `read` can return a partial
+            // line, and leaving bytes unread makes closing the socket send an
+            // RST that can discard the reply. See `running_version`.
+            let mut line = String::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match stream.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                        line.push(byte[0] as char);
+                        if line.len() > 128 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
                 }
-                "SHOW" => {
-                    apply_visibility(true, &ctx, hwnd, &visible);
-                }
-                "REPLACE" => {
-                    log::info!("a newer instance is taking over; exiting");
-                    crate::pet::request_shutdown();
-                    std::process::exit(0);
-                }
-                _ => {}
+            }
+            let command = line.trim();
+            // Reply with a single write so the client receives it in one piece.
+            if command.starts_with("HELLO") {
+                let _ = stream.write_all(format!("VERSION {CURRENT_VERSION}\n").as_bytes());
+            } else if command == "SHOW" {
+                apply_visibility(true, &ctx, hwnd, &visible);
+            } else if command == "REPLACE" {
+                log::info!("a newer instance is taking over; exiting");
+                crate::pet::request_shutdown();
+                std::process::exit(0);
             }
         }
     });
