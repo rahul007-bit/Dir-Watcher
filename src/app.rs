@@ -217,6 +217,8 @@ pub fn run() -> Result<(), String> {
     #[cfg(not(windows))]
     let root_viewport = root_viewport.with_transparent(true);
 
+    // `mut` is only needed by the Linux X11 block below.
+    #[allow(unused_mut)]
     let mut native_options = eframe::NativeOptions {
         viewport: root_viewport,
         ..Default::default()
@@ -251,6 +253,14 @@ pub fn run() -> Result<(), String> {
         Box::new(move |cc| {
             configure_style(&cc.egui_ctx);
             let hwnd = window_handle_isize(cc);
+            // Style the settings window by X id right away, before eframe's
+            // forced first show maps it. This keeps a hidden autostart launch
+            // out of the dock/taskbar and titles from flashing on screen.
+            #[cfg(not(windows))]
+            if hwnd != 0 {
+                let hidden = !visible.load(Ordering::SeqCst);
+                crate::pet::taskbar::x11_style_window(hwnd as u32, hidden, !hidden);
+            }
             let tray = create_tray(rgba_tray, tw, th)?;
 
             // Listen for other launches (show window / takeover requests).
@@ -358,6 +368,19 @@ fn window_handle_isize(cc: &eframe::CreationContext<'_>) -> isize {
             }
         }
     }
+    // On X11/XWayland this is the raw X window id, which lets us style the
+    // window (decorations, skip-taskbar) before the WM maps it.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = cc.window_handle() {
+            match handle.as_raw() {
+                RawWindowHandle::Xlib(h) => return h.window as isize,
+                RawWindowHandle::Xcb(h) => return h.window.get() as isize,
+                _ => {}
+            }
+        }
+    }
     let _ = cc;
     0
 }
@@ -373,6 +396,8 @@ fn apply_visibility(show: bool, ctx: &egui::Context, hwnd: isize, visible: &Arc<
     #[cfg(not(windows))]
     {
         if show {
+            // Restore the titlebar that was removed while parked (see below).
+            crate::pet::taskbar::x11_set_decorations("watch-folder", true);
             // Restore the size and place the window back where it was.
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                 SETTINGS_MIN_SIZE[0],
@@ -402,6 +427,9 @@ fn apply_visibility(show: bool, ctx: &egui::Context, hwnd: isize, visible: &Arc<
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(1.0, 1.0)));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+            // Drop the titlebar/borders: mutter otherwise still draws a
+            // titlebar-sized frame around the 1x1 client, which stays visible.
+            crate::pet::taskbar::x11_set_decorations("watch-folder", false);
         }
         // Keep the collapsed window out of the dock and Activities overview.
         crate::pet::taskbar::x11_set_skip_taskbar("watch-folder", !show);
@@ -884,6 +912,9 @@ struct App {
     current_version: Option<String>,
     do_install: bool,
     startup_frame: u32,
+    /// Last time we (re)asserted skip-taskbar for the hidden settings window.
+    #[cfg(not(windows))]
+    settings_skip_at: std::time::Instant,
 }
 
 impl App {
@@ -937,6 +968,11 @@ impl App {
         {
             pet.enabled = config.pet_enabled;
             pet.position_offset = config.pet_position_offset;
+            // On the X11/XWayland backend the pet viewport is a real X window:
+            // shape its input region so clicks on the sprite reach it (that is
+            // what makes dragging work on GNOME). On pure Wayland the overlay
+            // stays fully click-through instead.
+            pet.x11_shaped_input = x11_backend_available();
             pet.refresh_taskbar_coords();
         }
 
@@ -972,6 +1008,8 @@ impl App {
             current_version,
             do_install: force_install,
             startup_frame: 0,
+            #[cfg(not(windows))]
+            settings_skip_at: std::time::Instant::now(),
         }
     }
 
@@ -1704,6 +1742,20 @@ impl eframe::App for App {
             if self.startup_frame == 1 {
                 ctx.request_repaint();
             }
+        }
+
+        // The very first hide runs before the window manager has mapped the
+        // settings window, so its skip-taskbar request is lost and the dock
+        // keeps showing the app. Re-assert it periodically while hidden (the
+        // pet window is re-styled the same way in `refresh_taskbar`).
+        #[cfg(not(windows))]
+        if !self.visible.load(Ordering::SeqCst)
+            && (self.startup_frame <= 120
+                || self.settings_skip_at.elapsed() >= Duration::from_secs(2))
+        {
+            self.settings_skip_at = std::time::Instant::now();
+            crate::pet::taskbar::x11_set_skip_taskbar("watch-folder", true);
+            crate::pet::taskbar::x11_set_decorations("watch-folder", false);
         }
 
         // Re-assert the window icon explicitly. Some backends (notably X11)

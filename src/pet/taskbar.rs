@@ -142,6 +142,18 @@ fn x11_conn() -> Option<&'static x11rb::rust_connection::RustConnection> {
         .as_ref()
 }
 
+/// Whether the app can drive X11 (XWayland) helpers such as window styling and
+/// shaped input regions. Cheap after the first call (connection is cached).
+#[cfg(target_os = "linux")]
+pub fn x11_available() -> bool {
+    x11_conn().is_some()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn x11_available() -> bool {
+    false
+}
+
 /// Query the X11 pointer position (physical pixels on the XWAYLAND/X screen).
 ///
 /// The pet overlay is click-through, so it never receives pointer events from
@@ -170,7 +182,7 @@ fn x11_pointer() -> Option<(f32, f32, u16)> {
 pub fn x11_set_skip_taskbar(title: &str, skip: bool) {
     use x11rb::connection::Connection as _;
     use x11rb::protocol::xproto::{
-        AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as _, EventMask,
+        ClientMessageData, ClientMessageEvent, ConnectionExt as _, EventMask,
     };
 
     let Some(conn) = x11_conn() else {
@@ -186,34 +198,21 @@ pub fn x11_set_skip_taskbar(title: &str, skip: bool) {
             .ok()
             .map(|r| r.atom)
     };
-    let (Some(state), Some(skip_tb), Some(skip_pg), Some(list)) = (
+    let (Some(state), Some(skip_tb), Some(skip_pg)) = (
         atom("_NET_WM_STATE"),
         atom("_NET_WM_STATE_SKIP_TASKBAR"),
         atom("_NET_WM_STATE_SKIP_PAGER"),
-        atom("_NET_CLIENT_LIST"),
     ) else {
         return;
     };
 
-    let windows: Vec<u32> = conn
-        .get_property(false, root, list, AtomEnum::WINDOW, 0, u32::MAX)
-        .ok()
-        .and_then(|cookie| cookie.reply().ok())
-        .and_then(|reply| reply.value32().map(|iter| iter.collect()))
-        .unwrap_or_default();
-
-    // 0 = _NET_WM_STATE_REMOVE, 1 = _NET_WM_STATE_ADD
-    let action = if skip { 1u32 } else { 0u32 };
-    for window in windows {
-        if x11_window_title(conn, window).as_deref() != Some(title) {
-            continue;
-        }
+    for window in x11_find_windows_by_title(conn, title) {
         for property in [skip_tb, skip_pg] {
             let event = ClientMessageEvent::new(
                 32,
                 window,
                 state,
-                ClientMessageData::from([action, property, 0, 0, 0]),
+                ClientMessageData::from([action(skip), property, 0, 0, 0]),
             );
             let _ = conn.send_event(
                 false,
@@ -225,6 +224,197 @@ pub fn x11_set_skip_taskbar(title: &str, skip: bool) {
     }
     let _ = conn.flush();
 }
+
+/// 0 = `_NET_WM_STATE_REMOVE`, 1 = `_NET_WM_STATE_ADD`
+#[cfg(target_os = "linux")]
+fn action(skip: bool) -> u32 {
+    u32::from(skip)
+}
+
+/// All managed windows whose `_NET_WM_NAME`/`WM_NAME` equals `title`.
+#[cfg(target_os = "linux")]
+fn x11_find_windows_by_title(
+    conn: &x11rb::rust_connection::RustConnection,
+    title: &str,
+) -> Vec<u32> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    let Some(root) = conn.setup().roots.first().map(|r| r.root) else {
+        return Vec::new();
+    };
+    let Some(list) = conn
+        .intern_atom(false, b"_NET_CLIENT_LIST")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom)
+    else {
+        return Vec::new();
+    };
+    let windows: Vec<u32> = conn
+        .get_property(false, root, list, AtomEnum::WINDOW, 0, u32::MAX)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .and_then(|reply| reply.value32().map(|iter| iter.collect()))
+        .unwrap_or_default();
+
+    windows
+        .into_iter()
+        .filter(|w| x11_window_title(conn, *w).as_deref() == Some(title))
+        .collect()
+}
+
+/// Restrict the clickable area of the window titled `title` (the desktop-pet
+/// overlay) to `rects`, given in window-local physical pixels.
+///
+/// Everything outside these rects stays click-through, so clicks keep reaching
+/// the desktop below. Clicks that land inside the rects are received by the
+/// pet's own X11 window — and that is what makes dragging the pet work on
+/// GNOME/XWayland: a click on the sprite starts an implicit pointer grab that
+/// keeps pointer motion flowing to the pet window until release, even when the
+/// cursor travels over native Wayland surfaces (global polling cannot see that
+/// motion: `QueryPointer` freezes and raw events stop outside X windows).
+///
+/// An empty `rects` list makes the window fully click-through again.
+#[cfg(target_os = "linux")]
+pub fn x11_set_input_regions(title: &str, rects: &[(i32, i32, i32, i32)]) {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
+    use x11rb::protocol::xproto::{ClipOrdering, Rectangle};
+
+    let Some(conn) = x11_conn() else {
+        return;
+    };
+    let Some(window) = x11_find_windows_by_title(conn, title).into_iter().next() else {
+        return;
+    };
+    let shapes: Vec<Rectangle> = rects
+        .iter()
+        .filter(|(_, _, w, h)| *w > 0 && *h > 0)
+        .map(|(x, y, w, h)| Rectangle {
+            x: (*x).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            y: (*y).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            width: (*w).clamp(1, u16::MAX as i32) as u16,
+            height: (*h).clamp(1, u16::MAX as i32) as u16,
+        })
+        .collect();
+    let result = conn.shape_rectangles(
+        SO::SET,
+        SK::INPUT,
+        ClipOrdering::UNSORTED,
+        window,
+        0,
+        0,
+        &shapes,
+    );
+    if let Err(err) = result {
+        // Missing shape extension / not an X window (e.g. the app is on the
+        // Wayland backend) — retrying will not help.
+        log::debug!("x11_set_input_regions failed for '{title}': {err}");
+    }
+    let _ = conn.flush();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn x11_set_input_regions(_title: &str, _rects: &[(i32, i32, i32, i32)]) {}
+
+/// Add or remove the titlebar/borders of the window titled `title` via
+/// `_MOTIF_WM_HINTS` (mutter honours this for XWayland clients).
+///
+/// GNOME decorates XWayland windows with a separate frame window. When the
+/// settings window is parked (collapsed to a 1x1 client) that frame is still
+/// drawn as a titlebar-sized rectangle. Turning decorations off removes the
+/// frame so the parked window is truly invisible; turning them back on
+/// restores the titlebar when the settings window is shown again.
+#[cfg(target_os = "linux")]
+pub fn x11_set_decorations(title: &str, decorated: bool) {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let Some(conn) = x11_conn() else {
+        return;
+    };
+    let Some(hints) = conn
+        .intern_atom(false, b"_MOTIF_WM_HINTS")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom)
+    else {
+        return;
+    };
+    // flags = 2 (_MOTIF_WM_HINTS_DECORATIONS), functions = 0,
+    // decorations = 0/1, input_mode = 0, status = 0.
+    let values = [2u32, 0, u32::from(decorated), 0, 0];
+    for window in x11_find_windows_by_title(conn, title) {
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            hints,
+            AtomEnum::CARDINAL,
+            &values,
+        );
+    }
+    let _ = conn.flush();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn x11_set_decorations(_title: &str, _decorated: bool) {}
+
+/// Style a specific X11 window by id, before or after it is mapped.
+///
+/// Unlike the title-based helpers above (which can only find a window once the
+/// WM has added it to `_NET_CLIENT_LIST`, i.e. after it is already in the
+/// dock), this one works on a window that has been created but not yet mapped.
+/// Applying the decoration hint and the initial `_NET_WM_STATE` here is what
+/// stops an autostart launch from flashing into the dock/taskbar.
+#[cfg(target_os = "linux")]
+pub fn x11_style_window(window: u32, skip_taskbar: bool, decorated: bool) {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let Some(conn) = x11_conn() else {
+        return;
+    };
+    let atom = |name: &[u8]| -> Option<u32> {
+        conn.intern_atom(false, name)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+    };
+
+    if let Some(hints) = atom(b"_MOTIF_WM_HINTS") {
+        let values = [2u32, 0, u32::from(decorated), 0, 0];
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            hints,
+            AtomEnum::CARDINAL,
+            &values,
+        );
+    }
+    if skip_taskbar {
+        if let (Some(state), Some(tb), Some(pg)) = (
+            atom(b"_NET_WM_STATE"),
+            atom(b"_NET_WM_STATE_SKIP_TASKBAR"),
+            atom(b"_NET_WM_STATE_SKIP_PAGER"),
+        ) {
+            let _ = conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                state,
+                AtomEnum::ATOM,
+                &[tb, pg],
+            );
+        }
+    }
+    let _ = conn.flush();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn x11_style_window(_window: u32, _skip_taskbar: bool, _decorated: bool) {}
 
 #[cfg(target_os = "linux")]
 fn x11_window_title(conn: &x11rb::rust_connection::RustConnection, window: u32) -> Option<String> {
@@ -264,6 +454,16 @@ pub fn x11_set_skip_taskbar(_title: &str, _skip: bool) {}
 
 #[cfg(target_os = "linux")]
 pub fn get_global_cursor_pos() -> Option<(f32, f32)> {
+    // Prefer the position from raw events when it is fresh. On XWayland the
+    // raw events are the only source that keeps updating while the pointer is
+    // grabbed to an X11 window (i.e. while the pet is being dragged); a plain
+    // QueryPointer freezes as soon as the pointer is over a Wayland surface.
+    x11_raw::start();
+    if let Some((x, y, age_ms)) = x11_raw::pointer_hint() {
+        if age_ms < 250 {
+            return Some((x, y));
+        }
+    }
     x11_pointer().map(|(x, y, _)| (x, y))
 }
 
@@ -292,7 +492,7 @@ pub fn is_lbutton_pressed() -> bool {
 /// background thread listens for them and publishes the button state.
 #[cfg(target_os = "linux")]
 mod x11_raw {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
     use std::sync::Once;
 
     use x11rb::connection::Connection as _;
@@ -301,6 +501,19 @@ mod x11_raw {
 
     static START: Once = Once::new();
     static BUTTON1: AtomicBool = AtomicBool::new(false);
+    /// Pointer position (physical X-screen pixels) seen in the most recent raw
+    /// event, and the `Instant` (millis) at which it was seen.
+    static POS_X: AtomicI32 = AtomicI32::new(i32::MIN);
+    static POS_Y: AtomicI32 = AtomicI32::new(i32::MIN);
+    static POS_AT: AtomicU32 = AtomicU32::new(0);
+
+    /// Millis since the process started; timestamp source for `POS_AT`.
+    fn now_ms() -> u32 {
+        use std::sync::OnceLock;
+        static START_TIME: OnceLock<std::time::Instant> = OnceLock::new();
+        let start = START_TIME.get_or_init(std::time::Instant::now);
+        start.elapsed().as_millis().min(u32::MAX as u128) as u32
+    }
 
     pub fn start() {
         START.call_once(|| {
@@ -310,6 +523,37 @@ mod x11_raw {
 
     pub fn button1_down() -> bool {
         BUTTON1.load(Ordering::Relaxed)
+    }
+
+    /// Most recent raw-event pointer position and its age in milliseconds.
+    ///
+    /// Raw motion carries device-global screen coordinates that remain correct
+    /// while the pointer is grabbed by an X11 window (exactly the situation
+    /// while the pet is being dragged). `QueryPointer`, in contrast, reports a
+    /// frozen position whenever the pointer is over a native Wayland surface.
+    pub fn pointer_hint() -> Option<(f32, f32, u32)> {
+        let at = POS_AT.load(Ordering::Relaxed);
+        if at == 0 {
+            return None;
+        }
+        let x = POS_X.load(Ordering::Relaxed);
+        let y = POS_Y.load(Ordering::Relaxed);
+        if x == i32::MIN || y == i32::MIN {
+            return None;
+        }
+        let age = now_ms().wrapping_sub(at);
+        Some((x as f32, y as f32, age))
+    }
+
+    fn store_pos(ev: &x11rb::protocol::xinput::RawButtonPressEvent) {
+        let vals = &ev.axisvalues_raw;
+        if vals.len() >= 2 {
+            let x = vals[0].integral + (vals[0].frac as f64 / (1u64 << 32) as f64).round() as i32;
+            let y = vals[1].integral + (vals[1].frac as f64 / (1u64 << 32) as f64).round() as i32;
+            POS_X.store(x, Ordering::Relaxed);
+            POS_Y.store(y, Ordering::Relaxed);
+            POS_AT.store(now_ms(), Ordering::Relaxed);
+        }
     }
 
     fn listen() {
@@ -336,14 +580,25 @@ mod x11_raw {
         loop {
             match conn.wait_for_event() {
                 Ok(Event::XinputRawButtonPress(ev)) => {
+                    store_pos(&ev);
                     if ev.detail == 1 {
                         BUTTON1.store(true, Ordering::Relaxed);
+                        log::debug!(
+                            "raw button1 press at ({},{})",
+                            POS_X.load(Ordering::Relaxed),
+                            POS_Y.load(Ordering::Relaxed)
+                        );
                     }
                 }
                 Ok(Event::XinputRawButtonRelease(ev)) => {
+                    store_pos(&ev);
                     if ev.detail == 1 {
                         BUTTON1.store(false, Ordering::Relaxed);
+                        log::debug!("raw button1 release");
                     }
+                }
+                Ok(Event::XinputRawMotion(ev)) => {
+                    store_pos(&ev);
                 }
                 Ok(_) => {}
                 Err(_) => break,

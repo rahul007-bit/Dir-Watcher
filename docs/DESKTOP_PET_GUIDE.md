@@ -222,3 +222,40 @@ In [`src/pet/character.rs`](file:///C:/Users/HP/Projects/Dir-Watcher/src/pet/cha
   - **Sleeping**: When in `PetState::Sleeping`, `PetController::update()` returns `Duration::from_millis(300)` (0% CPU usage).
   - **Disabled**: Returns `Duration::from_millis(500)` and drains incoming events.
   - **Active**: Only during active walking, paper fluttering, or arranging does it request 60 FPS repaints (`Duration::from_millis(16)`).
+
+### 8. Linux / GNOME: Run the pet through XWayland
+
+On GNOME's native Wayland session a client cannot position its own window,
+force always-on-top, set click-through, or skip the taskbar/dock — everything
+the pet needs. The app therefore forces winit's **X11 (XWayland) backend**
+whenever an X display is available (`DISPLAY` set) and the required runtime
+library can be loaded.
+
+- **Required runtime library**: winit's X11 backend dlopens
+  `libxkbcommon-x11.so.0`. Without it the app silently falls back to native
+  Wayland, where the pet cannot be positioned or kept on top (file sorting and
+  the tray still work). Install it once:
+
+  ```
+  sudo apt install libxkbcommon-x11-0
+  ```
+
+  The probe is `x11_backend_available()` in `src/app.rs`; the log line
+  `using X11 (XWayland) backend for window placement` confirms it took effect.
+
+- **Hiding the settings window**: mutter decorates XWayland windows with a
+  *separate* frame window. Collapsing the client to `1x1` is not enough — the
+  titlebar-sized frame stays on screen. While hidden, set
+  `_MOTIF_WM_HINTS` decorations to `0` (and `_NET_WM_STATE_SKIP_TASKBAR` /
+  `SKIP_PAGER`), and restore the decorations when the window is shown.
+- **No dock flash at login**: eframe force-shows the root window once after the
+  first frame, and `_NET_CLIENT_LIST`-based lookups only see a window *after*
+  the WM has mapped it (already in the dock). Style the window **by its raw X
+  window id before it is mapped** (`x11_style_window`, id obtained from the
+  `raw_window_handle` of the `CreationContext`), then re-assert during a short
+  startup burst. Lookups by title remain only as a periodic fallback.
+- **Dragging**: with the X11 backend the pet viewport is a real X window whose
+  input region is shaped (`x11_set_input_regions`) to the sprite/desk/papers, so
+  a click starts an implicit pointer grab and drag motion keeps flowing to the
+  pet even over native Wayland surfaces.
+
