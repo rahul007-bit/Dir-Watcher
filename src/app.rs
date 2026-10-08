@@ -58,10 +58,14 @@ fn home_dir() -> std::path::PathBuf {
 /// Where an installed copy lives.
 fn install_path() -> std::path::PathBuf {
     #[cfg(windows)]
+    // Use real path separators: the autostart entry embeds this path verbatim,
+    // and the shell's Run-key launcher rejects a path with forward slashes.
     let path = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| home_dir().join("AppData/Local"))
-        .join("Programs/watch-folder/watch-folder.exe");
+        .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+        .join("Programs")
+        .join("watch-folder")
+        .join("watch-folder.exe");
     #[cfg(target_os = "macos")]
     let path = home_dir().join("Applications/watch-folder");
     #[cfg(all(unix, not(target_os = "macos")))]

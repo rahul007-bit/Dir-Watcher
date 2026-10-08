@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "watch-folder"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "auto-launch",
  "daemonize-me",
