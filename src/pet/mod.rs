@@ -122,6 +122,23 @@ pub struct PetController {
     /// Whether we have asked the window manager to keep the pet out of the
     /// taskbar / Activities overview (winit doesn't do this on Linux).
     pub pet_window_styled: bool,
+    /// Frames left in the post-creation burst that re-applies the pet window's
+    /// taskbar state (the first attempt can precede WM registration).
+    pet_style_burst: u32,
+    /// Whether the pet viewport is an X11 window whose input region we can
+    /// shape (the app is running on the X11/XWayland backend). Set once by the
+    /// app at startup; see `apply_x11_input_regions`.
+    pub x11_shaped_input: bool,
+    /// Clickable rects last applied via `x11_set_input_regions` (physical px).
+    last_input_regions: Vec<(i32, i32, i32, i32)>,
+    last_shape_apply: Instant,
+    /// Pointer state observed by the pet viewport itself (its own window gets
+    /// clicks on the sprite via the shaped input region). Positions are in the
+    /// same screen-logical space as `current_x` / `folder_x`.
+    viewport_button_down: bool,
+    viewport_button_at: Option<Instant>,
+    viewport_cursor: Option<(f32, f32)>,
+    viewport_cursor_at: Option<Instant>,
     pub sparkle_bursts: Vec<(f32, f32, f32)>, // (x, y, remaining_secs)
 
     // Coordinate scaling and positioning
@@ -185,6 +202,14 @@ impl PetController {
             thank_timer: 0.0,
             window_initialized: false,
             pet_window_styled: false,
+            pet_style_burst: 0,
+            x11_shaped_input: false,
+            last_input_regions: Vec::new(),
+            last_shape_apply: Instant::now(),
+            viewport_button_down: false,
+            viewport_button_at: None,
+            viewport_cursor: None,
+            viewport_cursor_at: None,
             sparkle_bursts: Vec::new(),
             ppp: 1.0,
             screen_size: None,
@@ -425,17 +450,32 @@ impl PetController {
             }
         }
 
-        // The overlay is click-through, so pointer events never reach it; we
-        // poll the global pointer instead. The button state comes from XInput2
-        // raw events (see `taskbar`), which — unlike `QueryPointer` — do see
-        // clicks that land on a Wayland surface.
-        let lbutton_down = taskbar::is_lbutton_pressed();
+        // Pointer input into the pet overlay itself, when it gets clicks via
+        // the shaped input region (X11/XWayland backend): exact positions and
+        // reliable button state, observed in `render()` during the last frame.
+        let viewport_fresh = |at: Option<Instant>| -> bool {
+            at.map(|t| t.elapsed() < std::time::Duration::from_millis(400))
+                .unwrap_or(false)
+        };
+        let mut lbutton_down = self.viewport_button_down && viewport_fresh(self.viewport_button_at);
+        // The pet's own window reports exact positions while it holds the
+        // pointer (a click on the shaped input region starts an implicit grab);
+        // outside that we fall back to the global pointer below. The button
+        // state also comes from XInput2 raw events (see `taskbar`).
+        let cursor_screen = self
+            .viewport_cursor
+            .filter(|_| viewport_fresh(self.viewport_cursor_at));
+
+        let lbutton_poll = taskbar::is_lbutton_pressed();
+        if !lbutton_down {
+            lbutton_down = lbutton_poll;
+        }
         let lbutton_clicked = lbutton_down && !self.was_lbutton_down;
         self.was_lbutton_down = lbutton_down;
 
         // --- Drag & drop Mochi and folder desk together when Mochi is idle ---
         if matches!(self.state, PetState::Sleeping | PetState::Grooming) {
-            if let Some((phys_x, phys_y)) = taskbar::get_global_cursor_pos() {
+            if let Some((phys_x, phys_y)) = cursor_screen.or_else(taskbar::get_global_cursor_pos) {
                 let ppp = self.ppp.max(0.5);
                 let cursor_x = phys_x / ppp;
                 let cursor_y = phys_y / ppp;
@@ -447,23 +487,48 @@ impl PetController {
                         let desk_min_y = self.current_y - 12.0;
                         let desk_max_y = self.current_y + 36.0;
 
-                        if cursor_x >= desk_min_x
+                        let hit = cursor_x >= desk_min_x
                             && cursor_x <= desk_max_x
                             && cursor_y >= desk_min_y
-                            && cursor_y <= desk_max_y
-                        {
+                            && cursor_y <= desk_max_y;
+                        if log::log_enabled!(log::Level::Debug) && lbutton_clicked {
+                            log::debug!(
+                                "drag probe: cursor=({cursor_x:.0},{cursor_y:.0}) ppp={ppp} \
+                                 home_x={:.0} folder_x={:.0} current_y={:.0} hit={hit} lclicked={lbutton_clicked}",
+                                self.home_x, self.folder_x, self.current_y
+                            );
+                        }
+
+                        if hit {
                             self.is_dragging_desk = true;
                             self.drag_start_cursor_x = cursor_x;
                             self.drag_start_offset = self.position_offset;
+                            log::debug!("drag started");
                         }
                     } else {
                         let delta = cursor_x - self.drag_start_cursor_x;
-                        self.position_offset =
-                            (self.drag_start_offset + delta).clamp(-1200.0, 300.0);
+                        // Allow moving the desk anywhere along the bottom edge
+                        // (the old hard clamp cut off the left half).
+                        let (lo, hi) = match self.screen_size {
+                            Some((w, _)) => (140.0 - w, w - 140.0),
+                            None => (-1200.0, 300.0),
+                        };
+                        let new_offset = (self.drag_start_offset + delta).clamp(lo, hi);
+                        if log::log_enabled!(log::Level::Debug)
+                            && (new_offset - self.position_offset).abs() > 1.0
+                        {
+                            log::debug!(
+                                "dragging: cursor_x={cursor_x:.0} delta={delta:.0} offset {:.0} -> {:.0}",
+                                self.position_offset,
+                                new_offset
+                            );
+                        }
+                        self.position_offset = new_offset;
                         self.refresh_taskbar_coords();
                     }
                 } else if self.is_dragging_desk {
                     self.is_dragging_desk = false;
+                    log::debug!("drag ended");
                 }
             }
         } else if self.is_dragging_desk {
@@ -795,6 +860,11 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
     /// Render the pet onto the egui context.
     pub fn render(&mut self, ctx: &egui::Context) {
         if !self.enabled {
+            // Make sure the hidden overlay does not keep intercepting clicks.
+            if self.x11_shaped_input && !self.last_input_regions.is_empty() {
+                self.last_input_regions.clear();
+                taskbar::x11_set_input_regions("DirWatcherPet", &[]);
+            }
             return;
         }
 
@@ -860,10 +930,51 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
                 .with_decorations(false)
                 .with_always_on_top()
                 .with_taskbar(false)
-                .with_mouse_passthrough(true) // Full desktop click-through
+                // On the X11/XWayland backend the pet window must RECEIVE
+                // clicks on the sprite (its input region is shaped further
+                // below), so it cannot be registered as mouse-passthrough. On
+                // a pure Wayland session we keep full click-through: dragging
+                // is impossible there anyway (no window positioning, no grabs)
+                // and a misplaced overlay must not block desktop clicks.
+                .with_mouse_passthrough(!self.x11_shaped_input)
+                // A click on the sprite should not steal keyboard focus from
+                // the user's work.
+                .with_active(false)
                 .with_inner_size([strip_w, strip_h])
                 .with_position([strip_x, strip_y]),
             |sub_ctx, _class| {
+                // Observe pointer state in the pet's own window. Clicks land on
+                // it via the shaped input region, so egui sees accurate local
+                // positions exact to the sprite — far more trustworthy than the
+                // QueryPointer/raw-valuator guesses used before. Drag motion
+                // while grabbed is also delivered here continuously.
+                let press = sub_ctx.input(|i| {
+                    i.pointer
+                        .primary_clicked()
+                        .then_some(i.pointer.press_origin())
+                });
+                if let Some(origin) = press {
+                    log::debug!("viewport press origin {origin:?}");
+                    if let Some(origin) = origin {
+                        self.viewport_cursor = Some(screen_point(origin, strip_x, strip_y, ppp));
+                        self.viewport_cursor_at = Some(Instant::now());
+                        self.viewport_button_down = true;
+                        self.viewport_button_at = Some(Instant::now());
+                    }
+                }
+                if self.viewport_button_down {
+                    let released = sub_ctx.input(|i| i.pointer.any_released());
+                    if released {
+                        self.viewport_button_down = false;
+                        self.viewport_button_at = None;
+                    }
+                    sub_ctx.input(|i| i.pointer.interact_pos()).inspect(|pos| {
+                        log::debug!("viewport pointer at {pos:?}");
+                        self.viewport_cursor =
+                            Some(screen_point(*pos, strip_x, strip_y, ppp));
+                        self.viewport_cursor_at = Some(Instant::now());
+                    });
+                }
                 egui::Area::new(egui::Id::new("pet_viewport_area"))
                     .fixed_pos(Pos2::ZERO)
                     .show(sub_ctx, |ui| {
@@ -1172,6 +1283,97 @@ fn draw_sparkle_star(painter: &egui::Painter, center: Pos2, radius: f32, color: 
             taskbar::x11_set_skip_taskbar("DirWatcherPet", true);
             self.pet_window_styled = true;
         }
+        // The window may not be registered with the WM on the first attempt, so
+        // re-assert for a short burst after creation (then `refresh_taskbar`
+        // keeps it applied periodically). Without this the pet can flash in the
+        // dock for a few seconds at login.
+        if self.pet_style_burst < 120 {
+            self.pet_style_burst += 1;
+            taskbar::x11_set_skip_taskbar("DirWatcherPet", true);
+        }
+
+        // Shape the pet window's clickable area: the sprite, the desk and any
+        // landed papers intercept clicks (needed to drag the pet and clear
+        // papers on GNOME/XWayland); the rest of the overlay stays
+        // click-through.
+        if self.x11_shaped_input {
+            self.apply_x11_input_regions(strip_x, strip_y, ppp);
+        }
     }
+
+    /// Compute the clickable input rects of the overlay, in window-local
+    /// physical pixels (strip-local logical coordinates scaled by `ppp`).
+    fn x11_input_regions(&self, strip_x: f32, strip_y: f32, ppp: f32) -> Vec<(i32, i32, i32, i32)> {
+        const PAD: f32 = 4.0; // comfortable click margin
+        let mut rects = Vec::new();
+
+        // The pet sprite (covers the Zzz particles and the carried stack).
+        let char_w = self.spec.frame_width as f32 * self.scale;
+        let char_h = self.spec.frame_height as f32 * self.scale;
+        rects.push(physical_rect(
+            self.current_x - strip_x - PAD,
+            self.current_y - strip_y - PAD,
+            char_w + 2.0 * PAD,
+            char_h + 2.0 * PAD,
+            ppp,
+        ));
+
+        // The folder desk.
+        rects.push(physical_rect(
+            self.folder_x - strip_x - PAD,
+            (self.current_y + 14.0) - strip_y - PAD,
+            16.0 + 2.0 * PAD,
+            16.0 + 2.0 * PAD,
+            ppp,
+        ));
+
+        // Landed papers (clickable to clear a blocked path).
+        for paper in &self.ground_papers {
+            if paper.landed {
+                rects.push(physical_rect(
+                    paper.x - 8.0 - strip_x - PAD,
+                    paper.current_y - strip_y - PAD,
+                    16.0 + 2.0 * PAD,
+                    16.0 + 2.0 * PAD,
+                    ppp,
+                ));
+            }
+        }
+
+        rects
+    }
+
+    /// Push the current input rects to the X server when they changed (and
+    /// re-assert them periodically in case the compositor dropped the shape).
+    fn apply_x11_input_regions(&mut self, strip_x: f32, strip_y: f32, ppp: f32) {
+        let rects = self.x11_input_regions(strip_x, strip_y, ppp);
+        let changed = rects != self.last_input_regions;
+        let stale = self.last_shape_apply.elapsed() > Duration::from_secs(3);
+        if !changed && !stale {
+            return;
+        }
+        if changed {
+            self.last_input_regions = rects.clone();
+        }
+        self.last_shape_apply = Instant::now();
+        taskbar::x11_set_input_regions("DirWatcherPet", &rects);
+    }
+}
+
+/// Logical strip-space rect → window-local physical pixel rect.
+fn physical_rect(x: f32, y: f32, w: f32, h: f32, ppp: f32) -> (i32, i32, i32, i32) {
+    (
+        (x * ppp).floor() as i32,
+        (y * ppp).floor() as i32,
+        (w * ppp).ceil() as i32,
+        (h * ppp).ceil() as i32,
+    )
+}
+
+/// A pointer position in the pet viewport (logical strip-local points, where
+/// the strip origin is `(strip_x, strip_y)`) → screen-logical coordinates, the
+/// same space the pet controller uses for `current_x` / `folder_x` etc.
+fn screen_point(pos: egui::Pos2, strip_x: f32, strip_y: f32, ppp: f32) -> (f32, f32) {
+    ((strip_x + pos.x) * ppp, (strip_y + pos.y) * ppp)
 }
 

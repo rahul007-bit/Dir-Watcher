@@ -1,6 +1,6 @@
 [package]
 name = "watch-folder"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -46,7 +46,12 @@ libc = "0.2"
 # (pure Rust; already in the tree via winit's X11 backend). XInput2 raw events
 # are needed because ordinary pointer queries do not see clicks that land on a
 # Wayland surface (which is exactly what a click-through overlay does).
-x11rb = { version = "0.13", features = ["xinput"] }
+    # "xtest" is used by examples/x11_drag_probe.rs (synthetic pointer
+    # injection for testing the drag path without touching the mouse).
+    # "shape" lets the pet viewport restrict its clickable area to the sprite
+    # (x11_set_input_regions in taskbar.rs), which is what makes dragging the
+    # pet work on GNOME/XWayland.
+    x11rb = { version = "0.13", features = ["xinput", "shape", "xtest"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = { version = "0.26", default-features = false }
